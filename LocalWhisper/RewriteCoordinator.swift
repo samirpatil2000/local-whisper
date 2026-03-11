@@ -11,6 +11,7 @@ final class RewriteCoordinator {
     let toolbarWindow: RewriteToolbarWindow
     
     private var currentSelectedText: String?
+    private var currentSelectionBounds: CGRect?
     private var isProcessing = false
     
     init(historyManager: HistoryManager, personaManager: PersonaManager) {
@@ -27,19 +28,24 @@ final class RewriteCoordinator {
         
         toolbarWindow.onDismiss = { [weak self] in
             self?.currentSelectedText = nil
+            self?.currentSelectionBounds = nil
         }
     }
     
     /// Called when text selection is detected.
     func showToolbar(selectedText: String, bounds: CGRect) {
+        guard !isProcessing else { return }
         currentSelectedText = selectedText
-        toolbarWindow.showToolbar(at: bounds, personas: personaManager.personas)
+        currentSelectionBounds = bounds
+        toolbarWindow.showToolbar(at: bounds)
     }
     
     /// Called when selection is cleared.
     func hideToolbar() {
+        guard !isProcessing else { return }
         toolbarWindow.hideToolbar()
         currentSelectedText = nil
+        currentSelectionBounds = nil
     }
     
     /// Performs the rewrite operation.
@@ -49,24 +55,17 @@ final class RewriteCoordinator {
         
         isProcessing = true
         
-        // Show processing state in toolbar
-        if let bounds = AccessibilityService.getSelectionBounds() {
-            toolbarWindow.showToolbar(at: bounds, personas: personaManager.personas, isProcessing: true)
+        // Show loading state — pulse the active pill
+        if let bounds = currentSelectionBounds {
+            toolbarWindow.showToolbar(at: bounds, processing: true, activeStyle: styleName)
         }
         
         let fullPrompt = """
-        You are rewriting the following text according to the user's instruction.
+        You are a writing assistant embedded in macOS. The user has selected the following text and chosen a rewrite style. Rewrite it according to the style. Return only the rewritten text. No explanations. No preamble. No quotation marks around the result.
         
-        INSTRUCTION: \(prompt)
+        Style: \(prompt)
         
-        OUTPUT RULES:
-        - Return ONLY the rewritten text
-        - No explanations, no labels, no preamble
-        - Do not wrap in quotes
-        - Start directly with the rewritten content
-        - Preserve formatting (line breaks, bullet points) where appropriate
-        
-        TEXT TO REWRITE:
+        Selected text:
         \(selectedText)
         """
         
@@ -75,7 +74,7 @@ final class RewriteCoordinator {
             let response = try await session.respond(to: fullPrompt)
             let result = response.content
             
-            // Replace the selected text in-place
+            // Replace the selected text in-place via clipboard paste
             AccessibilityService.replaceSelectedText(result)
             
             // Log to history
@@ -103,5 +102,6 @@ final class RewriteCoordinator {
         isProcessing = false
         toolbarWindow.hideToolbar()
         currentSelectedText = nil
+        currentSelectionBounds = nil
     }
 }

@@ -49,6 +49,37 @@ enum AccessibilityService {
         return NSWorkspace.shared.frontmostApplication?.processIdentifier
     }
     
+    /// Checks if the currently focused element is an editable text field.
+    /// Returns true for text fields and text areas that are not read-only.
+    static func isFocusedElementEditable() -> Bool {
+        guard let element = focusedElement() else { return false }
+        
+        // Check role — must be a text input element
+        var roleValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleValue) == .success,
+              let role = roleValue as? String else {
+            return false
+        }
+        
+        let editableRoles: Set<String> = [
+            kAXTextFieldRole as String,
+            kAXTextAreaRole as String,
+            "AXTextField",
+            "AXTextArea",
+            "AXComboBox",
+            "AXSearchField"
+        ]
+        
+        guard editableRoles.contains(role) else {
+            // Some apps use AXWebArea or AXGroup for contenteditable — check if value is settable
+            var isSettable: DarwinBoolean = false
+            let settableResult = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &isSettable)
+            return settableResult == .success && isSettable.boolValue
+        }
+        
+        return true
+    }
+    
     // MARK: - Read Selected Text
     
     /// Gets the currently selected text from the frontmost app's focused text field.

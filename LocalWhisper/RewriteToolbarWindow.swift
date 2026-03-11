@@ -1,62 +1,94 @@
 import AppKit
 import SwiftUI
 
-/// Floating toolbar that appears above selected text with rewrite options.
-/// Pill-shaped buttons in a single row with blur background, max height 36pt.
+// MARK: - Rewrite Toolbar Window
+
+/// Floating rewrite toolbar that appears above selected text.
+/// NSPanel with .popover material, 5 action pills, custom instruction mode.
+@MainActor
 final class RewriteToolbarWindow: NSPanel {
     
-    var onStyleSelected: ((String, String) -> Void)?  // (styleName, prompt)
+    var onStyleSelected: ((_ styleName: String, _ prompt: String) -> Void)?
     var onDismiss: (() -> Void)?
     
+    private let toolbarHeight: CGFloat = 38
+    private let toolbarContent: ToolbarContentState
     private var hostingView: NSHostingView<RewriteToolbarContent>?
     private var clickMonitor: Any?
     private var keyMonitor: Any?
     
     init() {
+        self.toolbarContent = ToolbarContentState()
+        
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 36),
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 38),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         
-        isFloatingPanel = true
-        level = .floating
         isOpaque = false
         backgroundColor = .clear
-        hasShadow = true
-        hidesOnDeactivate = false
+        hasShadow = false // We handle shadow manually
+        level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         isMovableByWindowBackground = false
+        hidesOnDeactivate = false
+        
+        setupContent()
     }
     
-    func showToolbar(at selectionBounds: CGRect, personas: [Persona], isProcessing: Bool = false) {
-        let content = RewriteToolbarContent(
-            personas: personas,
-            isProcessing: isProcessing,
-            onSelect: { [weak self] name, prompt in
-                self?.onStyleSelected?(name, prompt)
-            }
-        )
+    private func setupContent() {
+        toolbarContent.onAction = { [weak self] name, prompt in
+            self?.onStyleSelected?(name, prompt)
+        }
         
+        let content = RewriteToolbarContent(state: toolbarContent)
         let hosting = NSHostingView(rootView: content)
-        hosting.frame = NSRect(x: 0, y: 0, width: 500, height: 36)
         
-        // Size to fit content
-        let fittingSize = hosting.fittingSize
-        hosting.frame = NSRect(x: 0, y: 0, width: fittingSize.width, height: fittingSize.height)
-        
-        contentView = hosting
         hostingView = hosting
+        contentView = hosting
+    }
+    
+    // MARK: - Show / Hide
+    
+    func showToolbar(at selectionBounds: CGRect, processing: Bool = false, activeStyle: String? = nil) {
+        toolbarContent.isProcessing = processing
+        toolbarContent.activeStyleName = activeStyle
         
-        // Position above the selection
-        positionAboveSelection(selectionBounds, toolbarSize: fittingSize)
+        if processing {
+            // Don't reposition during processing — just update state
+            return
+        }
         
+        // Reset to pills mode
+        toolbarContent.mode = .pills
+        
+        // Calculate intrinsic size
+        let toolbarWidth = toolbarContent.currentWidth
+        let toolbarSize = NSSize(width: toolbarWidth, height: toolbarHeight)
+        
+        // Calculate position relative to selection
+        let position = calculatePosition(selectionBounds: selectionBounds, toolbarSize: toolbarSize)
+        
+        // Set frame — calculate everything BEFORE showing
+        setContentSize(toolbarSize)
+        setFrameOrigin(position)
+        
+        // Start invisible and scaled
         alphaValue = 0
+        contentView?.wantsLayer = true
+        contentView?.layer?.setAffineTransform(CGAffineTransform(scaleX: 0.92, y: 0.92))
+        
         orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.08
-            animator().alphaValue = 1
+        
+        // Animate in
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            context.allowsImplicitAnimation = true
+            self.animator().alphaValue = 1.0
+            self.contentView?.layer?.setAffineTransform(.identity)
         }
         
         installDismissMonitors()
@@ -64,186 +96,370 @@ final class RewriteToolbarWindow: NSPanel {
     
     func hideToolbar() {
         removeDismissMonitors()
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.08
-            animator().alphaValue = 0
+        
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.14
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            context.allowsImplicitAnimation = true
+            self.animator().alphaValue = 0
+            self.contentView?.layer?.setAffineTransform(CGAffineTransform(scaleX: 0.94, y: 0.94))
         }, completionHandler: {
             self.orderOut(nil)
+            self.contentView?.layer?.setAffineTransform(.identity)
+            self.toolbarContent.reset()
+            self.onDismiss?()
         })
     }
     
-    private func positionAboveSelection(_ bounds: CGRect, toolbarSize: NSSize) {
-        guard let screen = NSScreen.main else { return }
-        let screenFrame = screen.frame
+    /// Update toolbar width smoothly when switching to custom mode
+    func updateSize(animated: Bool = true) {
+        let newWidth = toolbarContent.currentWidth
+        let newSize = NSSize(width: newWidth, height: toolbarHeight)
+        let origin = NSPoint(
+            x: frame.midX - newWidth / 2,
+            y: frame.origin.y
+        )
+        let newFrame = NSRect(origin: origin, size: newSize)
         
-        // AX coordinates are top-left origin; convert to bottom-left for NSWindow
-        let flippedY = screenFrame.height - bounds.origin.y
-        
-        // Position above the selection with 8pt gap
-        var x = bounds.origin.x + (bounds.width / 2) - (toolbarSize.width / 2)
-        var y = flippedY + 8
-        
-        // Clamp to screen bounds
-        x = max(screenFrame.origin.x + 8, min(x, screenFrame.maxX - toolbarSize.width - 8))
-        y = max(screenFrame.origin.y + 8, min(y, screenFrame.maxY - toolbarSize.height - 8))
-        
-        setFrame(NSRect(x: x, y: y, width: toolbarSize.width, height: toolbarSize.height), display: true)
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.22
+                context.timingFunction = CAMediaTimingFunction(controlPoints: 0.25, 0.1, 0.25, 1.0)
+                self.animator().setFrame(newFrame, display: true)
+            }
+        } else {
+            setFrame(newFrame, display: true)
+        }
     }
+    
+    // MARK: - Position Calculation
+    
+    private func calculatePosition(selectionBounds: CGRect, toolbarSize: NSSize) -> NSPoint {
+        guard let screen = NSScreen.main else {
+            return NSPoint(x: selectionBounds.midX - toolbarSize.width / 2,
+                           y: selectionBounds.maxY + 10)
+        }
+        
+        let screenFrame = screen.frame
+        let gap: CGFloat = 10
+        
+        // macOS screen coordinates: origin at bottom-left, Y increases upward
+        // AX bounds: origin at top-left, Y increases downward
+        // Convert AX bounds to screen coordinates
+        let selectionTop = screenFrame.height - selectionBounds.origin.y
+        let selectionBottom = screenFrame.height - (selectionBounds.origin.y + selectionBounds.height)
+        
+        // Try positioning above the selection first
+        var y = selectionTop + gap
+        
+        // If too close to top of screen, flip to below
+        if y + toolbarSize.height > screenFrame.maxY - 10 {
+            y = selectionBottom - gap - toolbarSize.height
+        }
+        
+        // Horizontal: center on selection
+        var x = selectionBounds.midX - toolbarSize.width / 2
+        
+        // Clamp to screen edges
+        let pad: CGFloat = 8
+        if x < screenFrame.minX + pad {
+            x = screenFrame.minX + pad
+        }
+        if x + toolbarSize.width > screenFrame.maxX - pad {
+            x = screenFrame.maxX - pad - toolbarSize.width
+        }
+        
+        return NSPoint(x: x, y: y)
+    }
+    
+    // MARK: - Dismiss Monitors
     
     private func installDismissMonitors() {
         removeDismissMonitors()
         
-        // Click outside to dismiss
-        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            Task { @MainActor in
-                self?.hideToolbar()
-                self?.onDismiss?()
+        // Click outside
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, self.isVisible else { return }
+            let loc = NSEvent.mouseLocation
+            if !self.frame.contains(loc) {
+                Task { @MainActor in
+                    self.hideToolbar()
+                }
             }
         }
         
-        // Escape to dismiss
-        keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        // Escape key
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.isVisible else { return event }
             if event.keyCode == 53 { // Escape
                 Task { @MainActor in
-                    self?.hideToolbar()
-                    self?.onDismiss?()
+                    self.hideToolbar()
                 }
+                return nil
             }
+            return event
         }
     }
     
     private func removeDismissMonitors() {
-        if let monitor = clickMonitor {
-            NSEvent.removeMonitor(monitor)
+        if let m = clickMonitor {
+            NSEvent.removeMonitor(m)
             clickMonitor = nil
         }
-        if let monitor = keyMonitor {
-            NSEvent.removeMonitor(monitor)
+        if let m = keyMonitor {
+            NSEvent.removeMonitor(m)
             keyMonitor = nil
         }
     }
 }
 
-// MARK: - SwiftUI Toolbar Content
+// MARK: - Toolbar State
 
-private struct RewriteToolbarContent: View {
-    let personas: [Persona]
-    let isProcessing: Bool
-    let onSelect: (String, String) -> Void
+enum ToolbarMode {
+    case pills
+    case custom
+}
+
+@Observable
+@MainActor
+final class ToolbarContentState {
+    var mode: ToolbarMode = .pills
+    var isProcessing: Bool = false
+    var activeStyleName: String? = nil
+    var onAction: ((_ name: String, _ prompt: String) -> Void)?
     
-    @State private var showCustomField = false
-    @State private var customInstruction = ""
-    
-    private let defaultStyles: [(name: String, prompt: String)] = [
-        ("Rewrite", "Rewrite this text to be cleaner and more polished while preserving the original meaning."),
-        ("Formal", "Rewrite this text in a formal, professional business tone. Avoid contractions. Use precise language."),
-        ("Concise", "Compress this text to the absolute minimum words needed. Remove all redundancy and fluff."),
-        ("Friendly", "Rewrite this text in a warm, casual, and friendly tone. Use natural contractions and conversational language."),
-    ]
-    
-    var body: some View {
-        HStack(spacing: 4) {
-            if isProcessing {
-                ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.7)
-                    .padding(.horizontal, 8)
-                
-                Text("Rewriting…")
-                    .font(.system(size: 12, weight: .medium, design: .default))
-                    .foregroundColor(.white.opacity(0.7))
-            } else if showCustomField {
-                // Custom instruction inline field
-                HStack(spacing: 4) {
-                    TextField("Instruction…", text: $customInstruction)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12, design: .default))
-                        .foregroundColor(.white)
-                        .frame(width: 180)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color.white.opacity(0.15))
-                        .clipShape(Capsule())
-                        .onSubmit {
-                            if !customInstruction.isEmpty {
-                                onSelect("Custom", customInstruction)
-                                showCustomField = false
-                                customInstruction = ""
-                            }
-                        }
-                    
-                    Button("Cancel") {
-                        showCustomField = false
-                        customInstruction = ""
-                    }
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white.opacity(0.6))
-                    .buttonStyle(.plain)
-                }
-            } else {
-                // Default style pills
-                ForEach(defaultStyles, id: \.name) { style in
-                    ToolbarPill(title: style.name) {
-                        onSelect(style.name, style.prompt)
-                    }
-                }
-                
-                // Custom button
-                ToolbarPill(title: "Custom") {
-                    showCustomField = true
-                }
-                
-                // Persona pills (up to 3 more for max 8 total)
-                let personaSlots = min(personas.count, 3)
-                if personaSlots > 0 {
-                    Divider()
-                        .frame(height: 16)
-                        .background(Color.white.opacity(0.2))
-                    
-                    ForEach(personas.prefix(personaSlots)) { persona in
-                        ToolbarPill(title: persona.name) {
-                            onSelect(persona.name, persona.systemPrompt)
-                        }
-                    }
-                }
-            }
+    var currentWidth: CGFloat {
+        switch mode {
+        case .pills: return 320
+        case .custom: return 280
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(
-            ZStack {
-                RoundedRectangle(cornerRadius: 18)
-                    .fill(.ultraThinMaterial)
-                    .environment(\.colorScheme, .dark)
-                RoundedRectangle(cornerRadius: 18)
-                    .fill(Color.black.opacity(0.5))
-            }
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .shadow(color: .black.opacity(0.25), radius: 12, x: 0, y: 4)
-        .fixedSize()
+    }
+    
+    func reset() {
+        mode = .pills
+        isProcessing = false
+        activeStyleName = nil
     }
 }
 
-private struct ToolbarPill: View {
-    let title: String
+// MARK: - Toolbar Content (SwiftUI)
+
+struct RewriteToolbarContent: View {
+    @Bindable var state: ToolbarContentState
+    
+    var body: some View {
+        ZStack {
+            // Background: frosted glass
+            VisualEffectBackground()
+            
+            // Shadow layer
+            RoundedRectangle(cornerRadius: 19)
+                .fill(Color.clear)
+                .shadow(color: Color.black.opacity(0.30), radius: 16, x: 0, y: -4)
+            
+            // Border overlay
+            RoundedRectangle(cornerRadius: 19)
+                .strokeBorder(Color.white.opacity(0.10), lineWidth: 0.5)
+            
+            // Content
+            Group {
+                switch state.mode {
+                case .pills:
+                    PillsRow(state: state)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .leading).combined(with: .opacity),
+                            removal: .move(edge: .leading).combined(with: .opacity)
+                        ))
+                case .custom:
+                    CustomInputRow(state: state)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .move(edge: .trailing).combined(with: .opacity)
+                        ))
+                }
+            }
+            .animation(.spring(response: 0.22, dampingFraction: 0.75), value: state.mode)
+        }
+        .frame(height: 38)
+        .clipShape(RoundedRectangle(cornerRadius: 19))
+        .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Visual Effect Background (NSViewRepresentable)
+
+struct VisualEffectBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .popover
+        view.state = .active
+        view.blendingMode = .behindWindow
+        view.appearance = NSAppearance(named: .darkAqua)
+        view.wantsLayer = true
+        view.layer?.cornerRadius = 19
+        view.layer?.masksToBounds = true
+        return view
+    }
+    
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
+// MARK: - Pills Row
+
+struct PillsRow: View {
+    let state: ToolbarContentState
+    
+    private let styles: [(String, String)] = [
+        ("Rewrite", "Rewrite this text to be clearer and more polished while preserving the meaning."),
+        ("Formal", "Rewrite this text in a formal, professional tone."),
+        ("Concise", "Rewrite this text to be shorter and more concise while keeping the core meaning."),
+        ("Friendly", "Rewrite this text in a warm, friendly, conversational tone."),
+    ]
+    
+    var body: some View {
+        HStack(spacing: 0) {
+            Spacer().frame(width: 10)
+            
+            ForEach(Array(styles.enumerated()), id: \.offset) { index, style in
+                if index > 0 {
+                    PillDivider()
+                }
+                
+                PillButton(
+                    label: style.0,
+                    isPulsing: state.isProcessing && state.activeStyleName == style.0
+                ) {
+                    state.onAction?(style.0, style.1)
+                }
+            }
+            
+            PillDivider()
+            
+            PillButton(
+                label: "Custom",
+                isPulsing: state.isProcessing && state.activeStyleName == "Custom"
+            ) {
+                withAnimation(.spring(response: 0.22, dampingFraction: 0.75)) {
+                    state.mode = .custom
+                }
+            }
+            
+            Spacer().frame(width: 10)
+        }
+    }
+}
+
+// MARK: - Pill Button
+
+struct PillButton: View {
+    let label: String
+    let isPulsing: Bool
     let action: () -> Void
     
     @State private var isHovered = false
+    @State private var isPressed = false
+    @State private var pulseOpacity: Double = 0.88
     
     var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 12, weight: .medium, design: .default))
-                .foregroundColor(.white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(isHovered ? Color.white.opacity(0.2) : Color.white.opacity(0.08))
-                .clipShape(Capsule())
+        Text(label)
+            .font(.system(size: 12.5, weight: .medium, design: .rounded))
+            .foregroundColor(labelColor)
+            .padding(.horizontal, 14)
+            .frame(height: 28)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(backgroundColor)
+            )
+            .onHover { hovering in
+                isHovered = hovering
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .onTapGesture {
+                // Flash effect
+                isPressed = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                    isPressed = false
+                }
+                action()
+            }
+            .onChange(of: isPulsing) { _, pulsing in
+                if pulsing {
+                    startPulse()
+                }
+            }
+    }
+    
+    private var labelColor: Color {
+        if isPulsing {
+            return .white.opacity(pulseOpacity)
         }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            isHovered = hovering
+        return isHovered ? .white : .white.opacity(0.88)
+    }
+    
+    private var backgroundColor: Color {
+        if isPressed {
+            return .white.opacity(0.20)
+        }
+        return isHovered ? .white.opacity(0.10) : .clear
+    }
+    
+    private func startPulse() {
+        withAnimation(
+            .easeInOut(duration: 0.8)
+            .repeatForever(autoreverses: true)
+        ) {
+            pulseOpacity = 0.50
+        }
+    }
+}
+
+// MARK: - Pill Divider
+
+struct PillDivider: View {
+    var body: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.08))
+            .frame(width: 0.5, height: 16)
+    }
+}
+
+// MARK: - Custom Input Row
+
+struct CustomInputRow: View {
+    let state: ToolbarContentState
+    @State private var instruction: String = ""
+    @FocusState private var isFocused: Bool
+    
+    var body: some View {
+        HStack(spacing: 8) {
+            Spacer().frame(width: 14)
+            
+            TextField("Write an instruction…", text: $instruction)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12.5, weight: .regular))
+                .foregroundColor(.white)
+                .focused($isFocused)
+                .onSubmit {
+                    guard !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                    state.onAction?("Custom", instruction)
+                }
+                .onExitCommand {
+                    withAnimation(.spring(response: 0.22, dampingFraction: 0.75)) {
+                        state.mode = .pills
+                    }
+                }
+            
+            Spacer().frame(width: 14)
+        }
+        .onAppear {
+            // Become first responder after animation
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isFocused = true
+            }
         }
     }
 }

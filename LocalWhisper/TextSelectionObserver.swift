@@ -34,9 +34,12 @@ final class TextSelectionObserver {
         let trimmed = selectedText?.trimmingCharacters(in: .whitespacesAndNewlines)
         
         if let text = trimmed, !text.isEmpty {
-            // Text is selected — only notify if it changed
+            // Text is selected — only notify if it changed and the element is editable
             if text != lastSelectedText {
                 lastSelectedText = text
+                
+                // Only show toolbar for editable text fields
+                guard AccessibilityService.isFocusedElementEditable() else { return }
                 
                 if let bounds = AccessibilityService.getSelectionBounds() {
                     onSelectionChanged?(text, bounds)
