@@ -7,31 +7,118 @@ import FoundationModels
 
 @main
 struct LocalWhisperApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            MainAppView(
+                personaManager: appDelegate.personaManager,
+                historyManager: appDelegate.historyManager,
+                onFNToggleChanged: { [weak appDelegate] enabled in
+                    appDelegate?.setFNDictationEnabled(enabled)
+                },
+                onToolbarToggleChanged: { [weak appDelegate] enabled in
+                    appDelegate?.setFloatingToolbarEnabled(enabled)
+                }
+            )
         }
         .windowStyle(.titleBar)
-        .defaultSize(width: 680, height: 780)
+        .defaultSize(width: 600, height: 680)
     }
 }
 
-// MARK: - Enums
+// MARK: - Main App View (Three-Tab Layout)
 
-enum RewriteStyle: String, CaseIterable, Identifiable {
-    case professional = "Professional"
-    case casual = "Casual"
-    case concise = "Concise"
-    case formal = "Formal"
+struct MainAppView: View {
+    let personaManager: PersonaManager
+    let historyManager: HistoryManager
+    var onFNToggleChanged: ((Bool) -> Void)?
+    var onToolbarToggleChanged: ((Bool) -> Void)?
     
-    var id: String { rawValue }
+    @State private var selectedTab: AppTab = .personas
+    
+    enum AppTab: String, CaseIterable {
+        case personas = "Personas"
+        case history = "History"
+        case settings = "Settings"
+    }
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            // Tab bar
+            HStack(spacing: 0) {
+                ForEach(AppTab.allCases, id: \.self) { tab in
+                    TabButton(
+                        title: tab.rawValue,
+                        icon: tabIcon(tab),
+                        isSelected: selectedTab == tab
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            selectedTab = tab
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 12)
+            .padding(.bottom, 4)
+            
+            Divider()
+            
+            // Tab content
+            Group {
+                switch selectedTab {
+                case .personas:
+                    PersonasView(manager: personaManager)
+                case .history:
+                    HistoryView(manager: historyManager)
+                case .settings:
+                    SettingsView(
+                        historyManager: historyManager,
+                        onFNToggleChanged: onFNToggleChanged,
+                        onToolbarToggleChanged: onToolbarToggleChanged
+                    )
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(minWidth: 500, minHeight: 500)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+    
+    private func tabIcon(_ tab: AppTab) -> String {
+        switch tab {
+        case .personas: return "person.2"
+        case .history: return "clock"
+        case .settings: return "gearshape"
+        }
+    }
 }
 
-enum TranscriptionMode: String, CaseIterable, Identifiable {
-    case realtime = "Real-time"
-    case afterRecording = "After Recording"
+// MARK: - Tab Button
+
+private struct TabButton: View {
+    let title: String
+    let icon: String
+    let isSelected: Bool
+    let action: () -> Void
     
-    var id: String { rawValue }
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 12, weight: .medium))
+                Text(title)
+                    .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+            }
+            .foregroundColor(isSelected ? .accentColor : .secondary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(isSelected ? Color.accentColor.opacity(0.1) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+    }
 }
 
 // MARK: - Corrections Dictionary
@@ -78,8 +165,6 @@ final class CorrectionsDictionary: ObservableObject {
     func apply(to text: String) -> String {
         var result = text
         for entry in entries {
-            // Use regex for case-insensitive whole-word replacement if possible,
-            // or simple replacingOccurrences. We'll use simple case-insensitive replace for speed.
             result = result.replacingOccurrences(
                 of: "(?i)\\b\(NSRegularExpression.escapedPattern(for: entry.spoken))\\b",
                 with: entry.corrected,
@@ -107,7 +192,6 @@ final class SpeechRecognizer: ObservableObject {
     @Published var transcript: String = ""
     @Published var isRecording: Bool = false
     @Published var errorMessage: String? = nil
-    @Published var mode: TranscriptionMode = .realtime
     
     var corrections: CorrectionsDictionary?
     
@@ -122,13 +206,17 @@ final class SpeechRecognizer: ObservableObject {
     /// Whether the user intentionally stopped recording (vs. auto-restart).
     private var userRequestedStop: Bool = false
     
+    /// Continuation used to await the final recognition result when stopping global dictation.
+    private var stopContinuation: CheckedContinuation<Void, Never>?
+    
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var audioEngine = AVAudioEngine()
     
     init() {
-        speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        let locale = UserDefaults.standard.string(forKey: "dictationLanguage") ?? "en-US"
+        speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: locale))
         speechRecognizer?.supportsOnDeviceRecognition = true
     }
     
@@ -145,24 +233,72 @@ final class SpeechRecognizer: ObservableObject {
         return corrections?.apply(to: combined) ?? combined
     }
     
+    // MARK: - Global Dictation (Push-to-Talk)
+    
+    /// Start dictation for global FN key use (no UI transcript updates).
+    func startGlobalDictation() {
+        Task {
+            await startRecordingInternal(updateTranscriptLive: false)
+        }
+    }
+    
+    /// Stop global dictation and return the final transcript.
+    /// Waits for the speech recognizer to deliver its final result before returning.
+    func stopGlobalDictation() async -> String {
+        userRequestedStop = true
+        
+        // Stop the audio engine and signal end-of-audio, but DON'T cancel the task yet.
+        // Let the recognizer finish processing the buffered audio.
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        recognitionRequest?.endAudio()
+        
+        // Wait for the recognition task to deliver its final result.
+        // The callback in startRecognitionTask will resume this continuation.
+        await withCheckedContinuation { continuation in
+            self.stopContinuation = continuation
+            
+            // Safety timeout — if the recognizer doesn't respond in 2 seconds, proceed anyway.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                if let cont = self.stopContinuation {
+                    self.stopContinuation = nil
+                    self.commitCurrentSession()
+                    cont.resume()
+                }
+            }
+        }
+        
+        // Clean up
+        recognitionRequest = nil
+        recognitionTask = nil
+        isRecording = false
+        return fullTranscript
+    }
+    
+    // MARK: - Standard Recording
+    
     func toggleRecording() {
         if isRecording {
             userRequestedStop = true
             stopAudioAndRecognition()
             isRecording = false
-            
-            // In "after recording" mode, reveal the full transcript now
-            if mode == .afterRecording {
-                transcript = fullTranscript
-            }
+            transcript = fullTranscript
         } else {
             Task {
-                await startRecording()
+                await startRecordingInternal(updateTranscriptLive: true)
             }
         }
     }
     
-    private func startRecording() async {
+    private func startRecordingInternal(updateTranscriptLive: Bool) async {
+        // Guard against double-start
+        if isRecording {
+            return
+        }
+        
+        // Fully clean up any prior session first
+        forceCleanup()
+        
         errorMessage = nil
         transcript = ""
         accumulatedTranscript = ""
@@ -186,8 +322,9 @@ final class SpeechRecognizer: ObservableObject {
             return
         }
         
-        // Start audio engine (runs for the entire recording session)
+        // Start audio engine — always remove any stale tap first
         let inputNode = audioEngine.inputNode
+        inputNode.removeTap(onBus: 0)
         let recordingFormat = inputNode.outputFormat(forBus: 0)
         
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
@@ -199,24 +336,21 @@ final class SpeechRecognizer: ObservableObject {
             try audioEngine.start()
             isRecording = true
         } catch {
+            inputNode.removeTap(onBus: 0)
             errorMessage = "Failed to start audio engine: \(error.localizedDescription)"
             return
         }
         
-        // Start the first recognition session
-        startRecognitionTask()
+        startRecognitionTask(updateTranscriptLive: updateTranscriptLive)
     }
     
-    /// Starts (or restarts) just the recognition task — without
-    /// touching the audio engine, which keeps running continuously.
-    private func startRecognitionTask() {
+    /// Starts (or restarts) just the recognition task.
+    private func startRecognitionTask(updateTranscriptLive: Bool) {
         guard let speechRecognizer = speechRecognizer else { return }
         
-        // Cancel any prior task cleanly
         recognitionTask?.cancel()
         recognitionTask = nil
         
-        // Fresh request for this session
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
         guard let recognitionRequest = recognitionRequest else { return }
         
@@ -232,34 +366,41 @@ final class SpeechRecognizer: ObservableObject {
                 if let result = result {
                     self.currentSessionText = result.bestTranscription.formattedString
                     
-                    // Push to transcript in real-time mode
-                    if self.mode == .realtime {
+                    if updateTranscriptLive {
                         self.transcript = self.fullTranscript
                     }
                     
-                    // If this is a final result, commit it to accumulated
                     if result.isFinal {
                         self.commitCurrentSession()
+                        // If we're waiting for the final result (global dictation stop), resume.
+                        if let cont = self.stopContinuation {
+                            self.stopContinuation = nil
+                            cont.resume()
+                        }
                     }
                 }
                 
                 if let error = error {
-                    // Commit whatever we have so far from this session
                     self.commitCurrentSession()
+                    
+                    // If we're waiting for the final result, resume on error too.
+                    if let cont = self.stopContinuation {
+                        self.stopContinuation = nil
+                        cont.resume()
+                        return
+                    }
                     
                     let nsError = error as NSError
                     let isCancellation = nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 216
                     
                     if !isCancellation && !self.userRequestedStop {
-                        // Recognition timed out or hit a limit — auto-restart
-                        self.startRecognitionTask()
+                        self.startRecognitionTask(updateTranscriptLive: updateTranscriptLive)
                     }
                 }
             }
         }
         
-        // Re-install the audio tap to feed this new request
-        // (the engine is still running, we just need to reconnect the tap)
+        // Reconnect the audio tap to feed this new request
         let inputNode = audioEngine.inputNode
         inputNode.removeTap(onBus: 0)
         let recordingFormat = inputNode.outputFormat(forBus: 0)
@@ -280,16 +421,22 @@ final class SpeechRecognizer: ObservableObject {
         }
     }
     
-    /// Stops the audio engine and cancels recognition. Does NOT
-    /// update `isRecording` — the caller decides that.
+    /// Stops the audio engine and cancels recognition.
     private func stopAudioAndRecognition() {
-        audioEngine.stop()
+        forceCleanup()
+        commitCurrentSession()
+    }
+    
+    /// Hard cleanup of all audio and recognition resources.
+    private func forceCleanup() {
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
         audioEngine.inputNode.removeTap(onBus: 0)
         recognitionRequest?.endAudio()
         recognitionRequest = nil
         recognitionTask?.cancel()
         recognitionTask = nil
-        commitCurrentSession()
     }
 }
 
@@ -303,484 +450,40 @@ final class RewriteEngine: ObservableObject {
     
     var corrections: CorrectionsDictionary?
     
-    func rewrite(transcript: String, style: RewriteStyle) async {
-        guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            errorMessage = "Nothing to rewrite. Record some speech first."
-            return
+    func rewrite(text: String, prompt: String) async -> String? {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
         }
         
         isProcessing = true
         errorMessage = nil
-        rewrittenText = ""
         
-        let styleGuidance: String
-        switch style {
-        case .professional:
-            styleGuidance = """
-            STYLE: Professional
-            - Use clear, confident business language
-            - Structure with proper paragraphs if the content warrants it
-            - Replace casual phrasing with precise, authoritative alternatives
-            - Maintain a tone suitable for emails, reports, or presentations
-            - Eliminate hedging language ("I think", "maybe", "kind of")
-            """
-        case .casual:
-            styleGuidance = """
-            STYLE: Casual
-            - Keep a friendly, conversational but polished tone
-            - Use natural contractions (don't, can't, it's)
-            - Keep sentences short and punchy
-            - It should sound like a smart person talking to a friend — relaxed but articulate
-            - Remove filler words but keep the speaker's natural voice
-            """
-        case .concise:
-            styleGuidance = """
-            STYLE: Concise
-            - Compress to the absolute minimum words needed
-            - Remove every redundant word, phrase, and qualifier
-            - Use bullet points if the content has multiple distinct ideas
-            - Aim for maximum information density with zero fluff
-            - Every sentence must earn its place
-            """
-        case .formal:
-            styleGuidance = """
-            STYLE: Formal
-            - Use elevated, precise language appropriate for academic or legal contexts
-            - Avoid contractions entirely
-            - Use complete, well-constructed sentences with proper subordination
-            - Maintain objectivity and measured tone throughout
-            - Employ sophisticated vocabulary where it adds clarity, not complexity
-            """
-        }
-        
-        let prompt = """
-        You are rewriting spoken-aloud text into clean written English.
-        
-        CRITICAL CONTEXT: The input below was captured via speech recognition. It will contain:
-        - Filler words (um, uh, like, you know, so, basically, actually, right)
-        - False starts and self-corrections ("I was going to — well actually I think")
-        - Run-on thoughts with no punctuation
-        - Repetitions and restated ideas
-        - Informal or fragmented grammar
-        - Thoughts that trail off or jump between topics
+        let fullPrompt = """
+        You are rewriting the following text according to the user's instruction.
         \(corrections?.contextBlock() ?? "")
-        STRUCTURED DATA HANDLING:
-        - When the speaker dictates an email address, reconstruct it properly (e.g. "sameer s patil 7420 double 9 at gmail dot com" → use the closest match from the personal dictionary or format as an email).
-        - When the speaker says a phone number, format as digits (e.g. "double 9" = 99, "triple 0" = 000).
-        - When the speaker says a URL, reconstruct it (e.g. "github dot com slash something" → "github.com/something").
-        
-        YOUR JOB:
-        1. Extract the actual meaning and intent behind the spoken words
-        2. Remove ALL filler, repetition, false starts, and verbal noise
-        3. Reconstruct the ideas into clean, well-punctuated, grammatically correct written English
-        4. Preserve the speaker's original meaning — do not add ideas, opinions, or information that was not present
-        5. If the speaker made the same point multiple ways, keep the strongest version only
-        6. Apply the style guidelines below
-        
-        \(styleGuidance)
+        INSTRUCTION: \(prompt)
         
         OUTPUT RULES:
         - Return ONLY the rewritten text
-        - No explanations, no labels, no preamble, no "Here is the rewritten text:"
+        - No explanations, no labels, no preamble
         - Do not wrap in quotes
         - Start directly with the rewritten content
         
-        SPOKEN TEXT:
-        \(transcript)
+        TEXT:
+        \(text)
         """
         
         do {
             let session = LanguageModelSession()
-            let response = try await session.respond(to: prompt)
-            rewrittenText = response.content
+            let response = try await session.respond(to: fullPrompt)
+            let result = response.content
+            rewrittenText = result
+            isProcessing = false
+            return result
         } catch {
             errorMessage = "Rewrite failed: \(error.localizedDescription)"
+            isProcessing = false
+            return nil
         }
-        
-        isProcessing = false
-    }
-}
-
-// MARK: - Subviews
-
-struct CorrectionsPopover: View {
-    @ObservedObject var dictionary: CorrectionsDictionary
-    @State private var newSpoken = ""
-    @State private var newCorrected = ""
-    
-    var body: some View {
-        VStack(spacing: 0) {
-            Text("Personal Corrections")
-                .font(.system(size: 15, weight: .medium))
-                .padding(.top, 16)
-                .padding(.bottom, 8)
-            
-            Text("Teach Local Whisper how to transcribe specific names, terms, or email addresses.")
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 16)
-                .padding(.bottom, 16)
-            
-            Divider()
-            
-            if dictionary.entries.isEmpty {
-                VStack {
-                    Spacer()
-                    Text("No corrections yet.")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                }
-                .frame(height: 150)
-            } else {
-                List {
-                    ForEach(dictionary.entries) { entry in
-                        HStack {
-                            Text(entry.spoken)
-                                .foregroundColor(.secondary)
-                            Image(systemName: "arrow.right")
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-                            Text(entry.corrected)
-                                .foregroundColor(.primary)
-                            Spacer()
-                            Button(action: {
-                                if let index = dictionary.entries.firstIndex(where: { $0.id == entry.id }) {
-                                    dictionary.remove(at: IndexSet(integer: index))
-                                }
-                            }) {
-                                Image(systemName: "xmark.circle.fill")
-                                    .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .font(.system(size: 13))
-                        .padding(.vertical, 2)
-                    }
-                }
-                .listStyle(.plain)
-                .frame(height: 150)
-            }
-            
-            Divider()
-            
-            HStack(spacing: 8) {
-                TextField("When I say...", text: $newSpoken)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 13))
-                
-                Image(systemName: "arrow.right")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(Color(nsColor: .tertiaryLabelColor))
-                
-                TextField("Replace with...", text: $newCorrected)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 13))
-                
-                Button("Add") {
-                    dictionary.add(spoken: newSpoken, corrected: newCorrected)
-                    newSpoken = ""
-                    newCorrected = ""
-                }
-                .disabled(newSpoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || newCorrected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-            .padding(16)
-        }
-        .frame(width: 400)
-    }
-}
-
-// MARK: - Content View
-
-struct ContentView: View {
-    @StateObject private var dictionary = CorrectionsDictionary()
-    @StateObject private var speechRecognizer = SpeechRecognizer()
-    @StateObject private var rewriteEngine = RewriteEngine()
-    @State private var selectedStyle: RewriteStyle = .professional
-    @State private var showOutput: Bool = false
-    @State private var copied: Bool = false
-    @State private var showCorrections = false
-    
-    private let recordingRed = Color(red: 1.0, green: 0.231, blue: 0.188) // #FF3B30
-    
-    var body: some View {
-        VStack(spacing: 0) {
-            // App title area
-            HStack {
-                Spacer()
-                
-                VStack(spacing: 2) {
-                    Text("Local Whisper")
-                        .font(.system(size: 28, weight: .light, design: .default))
-                        .foregroundColor(.primary)
-                    
-                    Text("On-device. Private. Instant.")
-                        .font(.system(size: 13, weight: .regular))
-                        .foregroundColor(.secondary)
-                }
-                .padding(.leading, 70) // roughly balance the trailing corrections button
-                
-                Spacer()
-                
-                Button(action: { showCorrections.toggle() }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "book.closed")
-                        Text("Dictionary")
-                    }
-                    .font(.system(size: 13))
-                    .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-                .padding(.trailing, 32)
-                .popover(isPresented: $showCorrections) {
-                    CorrectionsPopover(dictionary: dictionary)
-                }
-            }
-            .padding(.top, 28)
-            .padding(.bottom, 20)
-            
-            // MARK: Top Zone — Transcription
-            
-            ZStack(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(nsColor: .textBackgroundColor))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
-                    )
-                
-                if speechRecognizer.transcript.isEmpty {
-                    if speechRecognizer.isRecording && speechRecognizer.mode == .afterRecording {
-                        // "After Recording" mode: show listening indicator
-                        VStack(spacing: 8) {
-                            Text("Listening…")
-                                .font(.system(size: 17, weight: .regular))
-                                .foregroundColor(Color(nsColor: .placeholderTextColor))
-                            Text("Transcript will appear when you stop recording.")
-                                .font(.system(size: 13, weight: .regular))
-                                .foregroundColor(Color(nsColor: .placeholderTextColor).opacity(0.7))
-                        }
-                        .padding(16)
-                    } else {
-                        Text("Start speaking…")
-                            .font(.system(size: 17, weight: .regular))
-                            .foregroundColor(Color(nsColor: .placeholderTextColor))
-                            .padding(16)
-                    }
-                }
-                
-                ScrollView {
-                    Text(speechRecognizer.transcript)
-                        .font(.system(size: 17, weight: .regular))
-                        .foregroundColor(.primary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(16)
-                        .textSelection(.enabled)
-                }
-            }
-            .frame(minHeight: 180, maxHeight: .infinity)
-            .padding(.horizontal, 32)
-            
-            // MARK: Middle Zone — Mode + Style Picker
-            
-            VStack(spacing: 10) {
-                Divider()
-                    .padding(.horizontal, 32)
-                    .padding(.top, 20)
-                
-                // Transcription mode toggle
-                HStack {
-                    Text("Transcription")
-                        .font(.system(size: 13, weight: .regular))
-                        .foregroundColor(.secondary)
-                    
-                    Spacer()
-                    
-                    Picker("Mode", selection: $speechRecognizer.mode) {
-                        ForEach(TranscriptionMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 240)
-                    .disabled(speechRecognizer.isRecording)
-                }
-                .padding(.horizontal, 32)
-                
-                // Style picker
-                Picker("Style", selection: $selectedStyle) {
-                    ForEach(RewriteStyle.allCases) { style in
-                        Text(style.rawValue).tag(style)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .padding(.horizontal, 32)
-                .padding(.bottom, 16)
-            }
-            
-            // MARK: Bottom Zone — Buttons
-            
-            HStack(spacing: 16) {
-                // Mic button
-                Button(action: {
-                    speechRecognizer.toggleRecording()
-                }) {
-                    ZStack {
-                        // Pulsing red background when recording
-                        if speechRecognizer.isRecording {
-                            Circle()
-                                .fill(recordingRed.opacity(0.2))
-                                .frame(width: 52, height: 52)
-                                .modifier(PulseModifier())
-                        }
-                        
-                        Circle()
-                            .fill(speechRecognizer.isRecording ? recordingRed : Color(nsColor: .controlColor))
-                            .frame(width: 44, height: 44)
-                        
-                        Image(systemName: "mic.fill")
-                            .font(.system(size: 18, weight: .medium))
-                            .foregroundColor(speechRecognizer.isRecording ? .white : .primary)
-                    }
-                }
-                .buttonStyle(.plain)
-                .frame(width: 56, height: 56)
-                
-                // Rewrite button
-                Button(action: {
-                    Task {
-                        showOutput = false
-                        await rewriteEngine.rewrite(
-                            transcript: speechRecognizer.transcript,
-                            style: selectedStyle
-                        )
-                        if rewriteEngine.errorMessage == nil {
-                            withAnimation(.easeIn(duration: 0.3)) {
-                                showOutput = true
-                            }
-                        } else {
-                            showOutput = true
-                        }
-                    }
-                }) {
-                    HStack(spacing: 6) {
-                        if rewriteEngine.isProcessing {
-                            ProgressView()
-                                .controlSize(.small)
-                                .scaleEffect(0.8)
-                        }
-                        Text("Rewrite")
-                            .font(.system(size: 15, weight: .medium))
-                    }
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 44)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(Color(red: 0.05, green: 0.05, blue: 0.2)) // Deep navy
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(rewriteEngine.isProcessing || speechRecognizer.transcript.isEmpty)
-                .opacity(speechRecognizer.transcript.isEmpty ? 0.5 : 1.0)
-            }
-            .padding(.horizontal, 32)
-            
-            // Error messages
-            if let error = speechRecognizer.errorMessage {
-                Text(error)
-                    .font(.system(size: 13, weight: .regular))
-                    .foregroundColor(recordingRed)
-                    .padding(.horizontal, 32)
-                    .padding(.top, 8)
-            }
-            
-            // MARK: Output Card
-            
-            if showOutput {
-                VStack(alignment: .leading, spacing: 0) {
-                    if let error = rewriteEngine.errorMessage {
-                        Text(error)
-                            .font(.system(size: 15, weight: .regular))
-                            .foregroundColor(recordingRed)
-                            .padding(16)
-                    } else {
-                        ZStack(alignment: .topTrailing) {
-                            ScrollView {
-                                Text(rewriteEngine.rewrittenText)
-                                    .font(.system(size: 17, weight: .regular))
-                                    .foregroundColor(.primary)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(16)
-                                    .padding(.trailing, 28)
-                                    .textSelection(.enabled)
-                            }
-                            
-                            // Copy button
-                            Button(action: {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(rewriteEngine.rewrittenText, forType: .string)
-                                copied = true
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                    copied = false
-                                }
-                            }) {
-                                Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundColor(.secondary)
-                                    .frame(width: 28, height: 28)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .padding(8)
-                        }
-                    }
-                }
-                .background(
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(Color(nsColor: .textBackgroundColor))
-                        .shadow(color: .black.opacity(0.08), radius: 8, x: 0, y: 2)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
-                )
-                .frame(minHeight: 80, maxHeight: 200)
-                .padding(.horizontal, 32)
-                .padding(.top, 16)
-                .transition(.opacity)
-            }
-            
-            Spacer(minLength: 24)
-        }
-        .frame(minWidth: 500, minHeight: 600)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear {
-            speechRecognizer.corrections = dictionary
-            rewriteEngine.corrections = dictionary
-        }
-    }
-}
-
-// MARK: - Pulse Animation Modifier
-
-struct PulseModifier: ViewModifier {
-    @State private var isPulsing = false
-    
-    func body(content: Content) -> some View {
-        content
-            .scaleEffect(isPulsing ? 1.3 : 1.0)
-            .opacity(isPulsing ? 0.0 : 0.6)
-            .animation(
-                .easeInOut(duration: 1.0)
-                .repeatForever(autoreverses: false),
-                value: isPulsing
-            )
-            .onAppear {
-                isPulsing = true
-            }
     }
 }

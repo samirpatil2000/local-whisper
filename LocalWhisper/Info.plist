@@ -9,18 +9,22 @@
 	<key>CFBundleIdentifier</key>
 	<string>com.localwhisper.app</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>2.0</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleExecutable</key>
 	<string>LocalWhisper</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.1</string>
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Local Whisper needs microphone access to transcribe your speech on-device.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Local Whisper uses on-device speech recognition to transcribe your voice.</string>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>Local Whisper needs accessibility access to detect text selection and inject transcribed text into any app.</string>
 </dict>
 </plist>
