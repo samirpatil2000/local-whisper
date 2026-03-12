@@ -312,6 +312,7 @@ final class SpeechRecognizer: ObservableObject {
     private var audioEngine = AVAudioEngine()
     
     private var rolloverTimer: Timer?
+    private var watchdogTimer: Timer?
     
     init() {
         let locale = UserDefaults.standard.string(forKey: "dictationLanguage") ?? "en-US"
@@ -463,6 +464,9 @@ final class SpeechRecognizer: ObservableObject {
                 guard let self = self else { return }
                 
                 if let result = result {
+                    // We got speech! Cancel the watchdog timer
+                    self.watchdogTimer?.invalidate()
+                    
                     self.currentSessionText = result.bestTranscription.formattedString
                     
                     if updateTranscriptLive {
@@ -513,6 +517,17 @@ final class SpeechRecognizer: ObservableObject {
                 self?.performRollover(updateTranscriptLive: updateTranscriptLive)
             }
         }
+        
+        // 5. Schedule a 3s watchdog timer. If we haven't seen *any* text by then,
+        // the SFSpeechRecognizer has likely deadlocked after inactivity. Reboot it.
+        watchdogTimer?.invalidate()
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 3.5, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self, self.isRecording, self.currentSessionText.isEmpty else { return }
+                print("[SpeechRecognizer] Watchdog fired: No speech detected in 3.5s. Rebooting recognizer...")
+                self.performRollover(updateTranscriptLive: updateTranscriptLive)
+            }
+        }
     }
     
     /// Bypasses the ~60s recognizer limit by cleanly ending the current session 
@@ -520,6 +535,7 @@ final class SpeechRecognizer: ObservableObject {
     private func performRollover(updateTranscriptLive: Bool) {
         guard isRecording else { return }
         rolloverTimer?.invalidate()
+        watchdogTimer?.invalidate()
         
         let oldRequest = recognitionRequest
         let oldTask = recognitionTask
@@ -562,8 +578,12 @@ final class SpeechRecognizer: ObservableObject {
         rolloverTimer?.invalidate()
         rolloverTimer = nil
         
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+        
         if audioEngine.isRunning {
             audioEngine.stop()
+            audioEngine.reset() // Critical for waking up CoreAudio after sleep/inactivity
         }
         audioEngine.inputNode.removeTap(onBus: 0)
         recognitionRequest?.endAudio()
