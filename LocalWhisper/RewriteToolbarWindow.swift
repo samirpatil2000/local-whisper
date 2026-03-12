@@ -34,8 +34,12 @@ final class RewriteToolbarWindow: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         isMovableByWindowBackground = false
         hidesOnDeactivate = false
+        appearance = NSAppearance(named: .darkAqua)
         
         setupContent()
+        
+        contentView?.wantsLayer = true
+        contentView?.layer?.masksToBounds = false
     }
     
     private func setupContent() {
@@ -231,6 +235,9 @@ struct RewriteToolbarContent: View {
     
     var body: some View {
         ZStack {
+            // Fallback solid background just in case material fails to render
+            Color(white: 0.12, opacity: 0.95)
+            
             // Background: frosted glass
             VisualEffectBackground()
             

@@ -42,6 +42,8 @@ struct MainAppView: View {
     var onToolbarToggleChanged: ((Bool) -> Void)?
     
     @State private var selectedTab: AppTab = .personas
+    @State private var isAccessibilityGranted: Bool = AXIsProcessTrusted()
+    @State private var bannerDismissed: Bool = false
     @Namespace private var animation
     
     enum AppTab: String, CaseIterable {
@@ -52,6 +54,46 @@ struct MainAppView: View {
     
     var body: some View {
         VStack(spacing: 0) {
+            
+            // Accessibility Banner
+            if !isAccessibilityGranted && !bannerDismissed {
+                HStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.yellow)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Accessibility access required for text injection.")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("Restart the app after granting access.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Button("Grant Access") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .buttonStyle(.link)
+                    .font(.system(size: 13, weight: .semibold))
+                    
+                    Button(action: { bannerDismissed = true }) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Color.yellow.opacity(0.15))
+                .overlay(
+                    Rectangle()
+                        .fill(Color(nsColor: .separatorColor))
+                        .frame(height: 0.5),
+                    alignment: .bottom
+                )
+            }
+            
             // Tab bar
             HStack(spacing: 32) {
                 Spacer()
@@ -95,6 +137,12 @@ struct MainAppView: View {
         }
         .frame(minWidth: 560, minHeight: 480)
         .background(Color(hex: "#F2F2F7"))
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+            let granted = AXIsProcessTrusted()
+            if granted != isAccessibilityGranted {
+                isAccessibilityGranted = granted
+            }
+        }
     }
     
     private func tabIcon(_ tab: AppTab) -> String {
@@ -262,6 +310,8 @@ final class SpeechRecognizer: ObservableObject {
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var audioEngine = AVAudioEngine()
+    
+    private var rolloverTimer: Timer?
     
     init() {
         let locale = UserDefaults.standard.string(forKey: "dictationLanguage") ?? "en-US"
@@ -449,12 +499,45 @@ final class SpeechRecognizer: ObservableObject {
             }
         }
         
+        
         // Reconnect the audio tap to feed this new request
         let inputNode = audioEngine.inputNode
         inputNode.removeTap(onBus: 0)
         let recordingFormat = inputNode.outputFormat(forBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
             self?.recognitionRequest?.append(buffer)
+        }
+        
+        // Schedule the 45s rollover timer to bypass the ~60s Apple limit
+        rolloverTimer?.invalidate()
+        rolloverTimer = Timer.scheduledTimer(withTimeInterval: 45.0, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                self?.performRollover(updateTranscriptLive: updateTranscriptLive)
+            }
+        }
+    }
+    
+    /// Bypasses the ~60s recognizer limit by cleanly ending the current session 
+    /// and immediately starting a new one without stopping the audio engine.
+    private func performRollover(updateTranscriptLive: Bool) {
+        guard isRecording else { return }
+        rolloverTimer?.invalidate()
+        
+        let oldRequest = recognitionRequest
+        let oldTask = recognitionTask
+        
+        // Finalize the current text chunks
+        commitCurrentSession()
+        
+        // End the audio on the old request so it flushes
+        oldRequest?.endAudio()
+        
+        // Immediately start a new task catching the stream
+        startRecognitionTask(updateTranscriptLive: updateTranscriptLive)
+        
+        // Give the old task 1 second to parse the flushed audio, then cancel
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            oldTask?.cancel()
         }
     }
     
@@ -478,6 +561,9 @@ final class SpeechRecognizer: ObservableObject {
     
     /// Hard cleanup of all audio and recognition resources.
     private func forceCleanup() {
+        rolloverTimer?.invalidate()
+        rolloverTimer = nil
+        
         if audioEngine.isRunning {
             audioEngine.stop()
         }

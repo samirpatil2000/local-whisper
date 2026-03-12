@@ -52,6 +52,7 @@ enum AccessibilityService {
     /// Checks if the currently focused element is an editable text field.
     /// Returns true for text fields and text areas that are not read-only.
     static func isFocusedElementEditable() -> Bool {
+        guard isAccessibilityEnabled() else { return false }
         guard let element = focusedElement() else { return false }
         
         // Check role — must be a text input element
@@ -84,6 +85,7 @@ enum AccessibilityService {
     
     /// Gets the currently selected text from the frontmost app's focused text field.
     static func getSelectedText() -> String? {
+        guard isAccessibilityEnabled() else { return nil }
         guard let element = focusedElement() else { return nil }
         
         var selectedText: AnyObject?
@@ -98,6 +100,7 @@ enum AccessibilityService {
     
     /// Gets the screen position of the current text selection for toolbar positioning.
     static func getSelectionBounds() -> CGRect? {
+        guard isAccessibilityEnabled() else { return nil }
         guard let element = focusedElement() else { return nil }
         
         // Try to get selected text range
@@ -144,6 +147,11 @@ enum AccessibilityService {
     /// Injects text by temporarily setting the clipboard and simulating Cmd+V.
     /// Runs paste simulation on a background thread with synchronous delays for precise timing.
     private static func injectViaClipboard(_ text: String) {
+        guard isAccessibilityEnabled() else {
+            print("[AccessibilityService] Cannot inject text: Accessibility permission not granted.")
+            return
+        }
+        
         let pasteboard = NSPasteboard.general
         
         // Save current clipboard contents

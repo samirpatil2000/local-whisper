@@ -35,6 +35,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         setupGlobalKeyListener()
         setupTextSelectionObserver()
         
+        // Ensure accessibility permission is prompt-requested on launch 
+        // if not already granted.
+        AccessibilityService.requestAccessibilityPermission()
+        
         // Hook into the main window as soon as it appears so we can intercept close.
         DispatchQueue.main.async {
             self.claimMainWindow()
