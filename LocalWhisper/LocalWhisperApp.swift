@@ -421,35 +421,34 @@ final class SpeechRecognizer: ObservableObject {
             return
         }
         
-        // Start audio engine — always remove any stale tap first
+        // Start the audio engine first (without a tap — safe, just activates hardware)
         let inputNode = audioEngine.inputNode
-        inputNode.removeTap(onBus: 0)
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
-        
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-            self?.recognitionRequest?.append(buffer)
-        }
+        inputNode.removeTap(onBus: 0) // Remove any stale tap from a crashed previous session
         
         do {
             audioEngine.prepare()
             try audioEngine.start()
             isRecording = true
         } catch {
-            inputNode.removeTap(onBus: 0)
             errorMessage = "Failed to start audio engine: \(error.localizedDescription)"
             return
         }
         
+        // Now set up the recognition request + tap atomically in one place.
+        // The request is created BEFORE the tap so no buffers are lost.
         startRecognitionTask(updateTranscriptLive: updateTranscriptLive)
     }
     
-    /// Starts (or restarts) just the recognition task.
+    /// Starts (or restarts) the recognition task.
+    /// This is the ONLY place where the audio tap is installed — never install taps elsewhere.
+    /// The request is created first, then the tap, so no audio buffers are lost.
     private func startRecognitionTask(updateTranscriptLive: Bool) {
         guard let speechRecognizer = speechRecognizer else { return }
         
         recognitionTask?.cancel()
         recognitionTask = nil
         
+        // 1. Create the recognition request FIRST
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
         guard let recognitionRequest = recognitionRequest else { return }
         
@@ -458,6 +457,7 @@ final class SpeechRecognizer: ObservableObject {
         
         currentSessionText = ""
         
+        // 2. Start the recognition task
         recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             Task { @MainActor in
                 guard let self = self else { return }
@@ -471,7 +471,6 @@ final class SpeechRecognizer: ObservableObject {
                     
                     if result.isFinal {
                         self.commitCurrentSession()
-                        // If we're waiting for the final result (global dictation stop), resume.
                         if let cont = self.stopContinuation {
                             self.stopContinuation = nil
                             cont.resume()
@@ -482,7 +481,6 @@ final class SpeechRecognizer: ObservableObject {
                 if let error = error {
                     self.commitCurrentSession()
                     
-                    // If we're waiting for the final result, resume on error too.
                     if let cont = self.stopContinuation {
                         self.stopContinuation = nil
                         cont.resume()
@@ -499,8 +497,8 @@ final class SpeechRecognizer: ObservableObject {
             }
         }
         
-        
-        // Reconnect the audio tap to feed this new request
+        // 3. Install the audio tap AFTER the request exists (so buffers go to a live request)
+        //    Always remove first to prevent nullptr == Tap() Core Audio crash.
         let inputNode = audioEngine.inputNode
         inputNode.removeTap(onBus: 0)
         let recordingFormat = inputNode.outputFormat(forBus: 0)
@@ -508,7 +506,7 @@ final class SpeechRecognizer: ObservableObject {
             self?.recognitionRequest?.append(buffer)
         }
         
-        // Schedule the 45s rollover timer to bypass the ~60s Apple limit
+        // 4. Schedule the 45s rollover timer to bypass the ~60s Apple limit
         rolloverTimer?.invalidate()
         rolloverTimer = Timer.scheduledTimer(withTimeInterval: 45.0, repeats: false) { [weak self] _ in
             Task { @MainActor in
