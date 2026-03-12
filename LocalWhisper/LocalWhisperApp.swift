@@ -36,6 +36,7 @@ struct MainAppView: View {
     var onToolbarToggleChanged: ((Bool) -> Void)?
     
     @State private var selectedTab: AppTab = .personas
+    @Namespace private var animation
     
     enum AppTab: String, CaseIterable {
         case personas = "Personas"
@@ -46,24 +47,28 @@ struct MainAppView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Tab bar
-            HStack(spacing: 0) {
+            HStack(spacing: 32) {
+                Spacer()
                 ForEach(AppTab.allCases, id: \.self) { tab in
                     TabButton(
                         title: tab.rawValue,
                         icon: tabIcon(tab),
-                        isSelected: selectedTab == tab
+                        isSelected: selectedTab == tab,
+                        namespace: animation
                     ) {
-                        withAnimation(.easeInOut(duration: 0.15)) {
+                        withAnimation(.spring(response: 0.22, dampingFraction: 0.8)) {
                             selectedTab = tab
                         }
                     }
                 }
+                Spacer()
             }
-            .padding(.horizontal, 24)
-            .padding(.top, 12)
-            .padding(.bottom, 4)
+            .frame(height: 52)
+            .background(Color.white)
             
-            Divider()
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor))
+                .frame(height: 0.5)
             
             // Tab content
             Group {
@@ -82,8 +87,8 @@ struct MainAppView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 500, minHeight: 500)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(minWidth: 560, minHeight: 480)
+        .background(Color(hex: "#F2F2F7"))
     }
     
     private func tabIcon(_ tab: AppTab) -> String {
@@ -101,23 +106,61 @@ private struct TabButton: View {
     let title: String
     let icon: String
     let isSelected: Bool
+    let namespace: Namespace.ID
     let action: () -> Void
     
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 5) {
+            VStack(spacing: 4) {
                 Image(systemName: icon)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 16))
                 Text(title)
-                    .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+                    .font(.system(size: 13, weight: .medium))
             }
-            .foregroundColor(isSelected ? .accentColor : .secondary)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 7)
-            .background(isSelected ? Color.accentColor.opacity(0.1) : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .foregroundColor(isSelected ? .accentColor : Color(hex: "#8E8E93"))
+            .frame(width: 64)
+            .contentShape(Rectangle())
+            .overlay(
+                VStack {
+                    Spacer()
+                    if isSelected {
+                        Rectangle()
+                            .fill(Color.accentColor)
+                            .frame(height: 2)
+                            .matchedGeometryEffect(id: "TabUnderline", in: namespace)
+                    }
+                }
+                .padding(.bottom, -8) // aligns perfectly to the bottom edge of the 52pt height
+            )
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Color Hex Extension
+extension Color {
+    init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let a, r, g, b: UInt64
+        switch hex.count {
+        case 3: // RGB (12-bit)
+            (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
+        case 6: // RGB (24-bit)
+            (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
+        case 8: // ARGB (32-bit)
+            (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
+        default:
+            (a, r, g, b) = (255, 0, 0, 0)
+        }
+        self.init(
+            .sRGB,
+            red: Double(r) / 255,
+            green: Double(g) / 255,
+            blue:  Double(b) / 255,
+            opacity: Double(a) / 255
+        )
     }
 }
 

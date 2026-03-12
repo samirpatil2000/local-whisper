@@ -65,19 +65,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     
     @objc private func openMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        // The SwiftUI WindowGroup handles window creation
         if let window = NSApp.windows.first(where: { $0.title == "Local Whisper" || $0.contentView is NSHostingView<MainAppView> }) {
+            configureWindow(window)
             window.makeKeyAndOrderFront(nil)
         } else {
-            // Open a new window by sending the standard "new window" command
-            // In our case, the WindowGroup handles this
             for window in NSApp.windows {
                 if !(window is NSPanel) {
+                    configureWindow(window)
                     window.makeKeyAndOrderFront(nil)
                     break
                 }
             }
         }
+    }
+    
+    private func configureWindow(_ window: NSWindow) {
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.backgroundColor = NSColor(red: 242/255, green: 242/255, blue: 247/255, alpha: 1.0) // #F2F2F7
     }
     
     // MARK: - Coordinators

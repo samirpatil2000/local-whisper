@@ -23,46 +23,77 @@ struct HistoryView: View {
             .padding(.bottom, 16)
             
             if manager.entries.isEmpty {
-                Spacer()
-                VStack(spacing: 8) {
-                    Image(systemName: "clock")
-                        .font(.system(size: 32, weight: .light))
-                        .foregroundColor(.secondary.opacity(0.5))
-                    Text("No history yet")
-                        .font(.system(size: 15, weight: .regular))
-                        .foregroundColor(.secondary)
-                    Text("Dictations and rewrites will appear here.")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary.opacity(0.7))
-                }
-                Spacer()
+                HistoryEmptyState()
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 1) {
-                        ForEach(manager.entries) { entry in
-                            HistoryRow(
-                                entry: entry,
-                                isExpanded: expandedEntryId == entry.id,
-                                onToggle: {
-                                    withAnimation(.easeInOut(duration: 0.15)) {
-                                        if expandedEntryId == entry.id {
-                                            expandedEntryId = nil
-                                        } else {
-                                            expandedEntryId = entry.id
-                                        }
-                                    }
-                                }
-                            )
-                        }
-                    }
-                    .padding(.bottom, 20)
-                }
+                HistoryListView(manager: manager, expandedEntryId: $expandedEntryId)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(Color(hex: "#F2F2F7"))
     }
 }
+
+// MARK: - Subviews
+
+private struct HistoryEmptyState: View {
+    var body: some View {
+        Spacer()
+        VStack(spacing: 8) {
+            Text("No history yet")
+                .font(.system(size: 15, weight: .regular))
+                .foregroundColor(Color(hex: "#8E8E93"))
+            Text("Dictations and rewrites will appear here.")
+                .font(.system(size: 13))
+                .foregroundColor(Color(hex: "#8E8E93"))
+        }
+        Spacer()
+    }
+}
+
+private struct HistoryListView: View {
+    @Bindable var manager: HistoryManager
+    @Binding var expandedEntryId: UUID?
+    
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(manager.entries) { (entry: HistoryEntry) in
+                    entryRow(for: entry)
+                }
+            }
+            .padding(.bottom, 20)
+        }
+    }
+    
+    @ViewBuilder
+    private func entryRow(for entry: HistoryEntry) -> some View {
+        let isLast = entry.id == manager.entries.last?.id
+        
+        VStack(spacing: 0) {
+            HistoryRow(
+                entry: entry,
+                isExpanded: expandedEntryId == entry.id,
+                onToggle: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        if expandedEntryId == entry.id {
+                            expandedEntryId = nil
+                        } else {
+                            expandedEntryId = entry.id
+                        }
+                    }
+                }
+            )
+            
+            if !isLast {
+                Rectangle()
+                    .fill(Color(hex: "#E5E5EA"))
+                    .frame(height: 0.5)
+                    .padding(.leading, 52)
+            }
+        }
+    }
+}
+
 
 // MARK: - History Row
 
@@ -77,103 +108,94 @@ private struct HistoryRow: View {
         Button(action: onToggle) {
             VStack(alignment: .leading, spacing: 0) {
                 // Compact row
-                HStack(spacing: 10) {
-                    // Action badge
+                HStack(spacing: 16) {
                     ActionBadge(action: entry.action)
                     
                     VStack(alignment: .leading, spacing: 2) {
                         Text(entry.resultText)
-                            .font(.system(size: 13))
-                            .foregroundColor(.primary)
-                            .lineLimit(isExpanded ? nil : 1)
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundColor(Color(hex: "#1C1C1E"))
+                            .lineLimit(1)
                         
                         Text(entry.formattedTimestamp)
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary)
+                            .font(.system(size: 12))
+                            .foregroundColor(Color(hex: "#8E8E93"))
                     }
                     
                     Spacer()
-                    
-                    if !isExpanded {
-                        Text(entry.styleName)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color(nsColor: .separatorColor).opacity(0.3))
-                            .clipShape(Capsule())
-                    }
-                    
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(.secondary.opacity(0.4))
                 }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+                .contentShape(Rectangle())
                 
                 // Expanded details
                 if isExpanded {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Divider()
-                            .padding(.vertical, 6)
-                        
-                        if !entry.originalText.isEmpty {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("ORIGINAL")
-                                    .font(.system(size: 10, weight: .semibold))
-                                    .foregroundColor(.secondary)
-                                Text(entry.originalText)
-                                    .font(.system(size: 13))
-                                    .foregroundColor(.primary.opacity(0.7))
-                                    .textSelection(.enabled)
-                            }
-                        }
-                        
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("RESULT")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundColor(.secondary)
-                            Text(entry.resultText)
-                                .font(.system(size: 13))
-                                .foregroundColor(.primary)
-                                .textSelection(.enabled)
-                        }
-                        
-                        HStack(spacing: 12) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "tag")
-                                    .font(.system(size: 10))
-                                Text(entry.styleName)
-                                    .font(.system(size: 11, weight: .medium))
-                            }
-                            .foregroundColor(.secondary)
-                            
-                            Spacer()
-                            
-                            Button(action: {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(entry.resultText, forType: .string)
-                                copied = true
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                    copied = false
-                                }
-                            }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                                        .font(.system(size: 11))
-                                    Text(copied ? "Copied" : "Copy")
-                                        .font(.system(size: 12, weight: .medium))
-                                }
-                                .foregroundColor(copied ? .green : .accentColor)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
+                    ExpandedDetails(entry: entry, copied: $copied)
                 }
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 10)
-            .background(Color(nsColor: .controlBackgroundColor))
+            .background(Color.white)
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Expanded Details
+
+private struct ExpandedDetails: View {
+    let entry: HistoryEntry
+    @Binding var copied: Bool
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Rectangle()
+                .fill(Color(hex: "#E5E5EA"))
+                .frame(height: 0.5)
+            
+            if !entry.originalText.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("ORIGINAL")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(Color(hex: "#8E8E93"))
+                    Text(entry.originalText)
+                        .font(.system(size: 14))
+                        .foregroundColor(Color(hex: "#1C1C1E"))
+                        .textSelection(.enabled)
+                }
+            }
+            
+            VStack(alignment: .leading, spacing: 6) {
+                Text("RESULT")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Color(hex: "#8E8E93"))
+                Text(entry.resultText)
+                    .font(.system(size: 14))
+                    .foregroundColor(Color(hex: "#1C1C1E"))
+                    .textSelection(.enabled)
+            }
+            
+            HStack {
+                Spacer()
+                Button(action: {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(entry.resultText, forType: .string)
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        copied = false
+                    }
+                }) {
+                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 13))
+                        .foregroundColor(copied ? .green : .accentColor)
+                }
+                .buttonStyle(.plain)
+            }
+            
+            Rectangle()
+                .fill(Color(hex: "#E5E5EA"))
+                .frame(height: 0.5)
+        }
+        .padding(.horizontal, 52)
+        .padding(.bottom, 12)
     }
 }
 
@@ -196,17 +218,24 @@ private struct ActionBadge: View {
     
     private var color: Color {
         switch action {
-        case .dictation: return .red
+        case .dictation: return Color(hex: "#FF3B30")
         default: return .accentColor
+        }
+    }
+    
+    private var bgColor: Color {
+        switch action {
+        case .dictation: return Color(hex: "#FFF0EE")
+        default: return Color(hex: "#EEF4FF")
         }
     }
     
     var body: some View {
         Image(systemName: icon)
-            .font(.system(size: 11, weight: .medium))
+            .font(.system(size: 16))
             .foregroundColor(color)
-            .frame(width: 26, height: 26)
-            .background(color.opacity(0.1))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .frame(width: 36, height: 36)
+            .background(bgColor)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }

@@ -11,6 +11,9 @@ struct SettingsView: View {
     
     @State private var showClearConfirmation = false
     
+    @State private var shakeOffset: CGFloat = 0
+    
+    // ... supported languages ...
     private let supportedLanguages: [(code: String, name: String)] = [
         ("en-US", "English (US)"),
         ("en-GB", "English (UK)"),
@@ -30,124 +33,145 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                Text("Settings")
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundColor(.primary)
-                    .padding(.horizontal, 24)
-                    .padding(.top, 20)
-                    .padding(.bottom, 20)
                 
                 // MARK: - Features Section
                 
                 SectionHeader(title: "FEATURES")
+                    .padding(.top, 24)
                 
-                SettingsRow(
-                    icon: "keyboard",
-                    title: "FN Key Dictation",
-                    subtitle: "Hold the FN key anywhere to dictate"
-                ) {
-                    Toggle("", isOn: $fnDictationEnabled)
-                        .toggleStyle(.switch)
-                        .labelsHidden()
-                        .onChange(of: fnDictationEnabled) { _, newValue in
-                            onFNToggleChanged?(newValue)
-                        }
-                }
-                
-                Divider().padding(.leading, 56)
-                
-                SettingsRow(
-                    icon: "text.cursor",
-                    title: "Floating Toolbar",
-                    subtitle: "Show rewrite options on text selection"
-                ) {
-                    Toggle("", isOn: $floatingToolbarEnabled)
-                        .toggleStyle(.switch)
-                        .labelsHidden()
-                        .onChange(of: floatingToolbarEnabled) { _, newValue in
-                            onToolbarToggleChanged?(newValue)
-                        }
+                CardGroup {
+                    SettingsRow(
+                        icon: "keyboard",
+                        iconColor: Color.blue,
+                        title: "FN Key Dictation",
+                        subtitle: "Hold the FN key anywhere to dictate"
+                    ) {
+                        Toggle("", isOn: $fnDictationEnabled)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                            .onChange(of: fnDictationEnabled) { _, newValue in
+                                onFNToggleChanged?(newValue)
+                            }
+                    }
+                    
+                    Rectangle()
+                        .fill(Color(hex: "#E5E5EA"))
+                        .frame(height: 0.5)
+                        .padding(.leading, 52)
+                    
+                    SettingsRow(
+                        icon: "text.cursor",
+                        iconColor: Color.blue,
+                        title: "Floating Toolbar",
+                        subtitle: "Show rewrite options on text selection"
+                    ) {
+                        Toggle("", isOn: $floatingToolbarEnabled)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                            .onChange(of: floatingToolbarEnabled) { _, newValue in
+                                onToolbarToggleChanged?(newValue)
+                            }
+                    }
                 }
                 
                 // MARK: - Language Section
                 
                 SectionHeader(title: "LANGUAGE")
-                    .padding(.top, 20)
+                    .padding(.top, 24)
                 
-                SettingsRow(
-                    icon: "globe",
-                    title: "Dictation Language",
-                    subtitle: "Language for speech recognition"
-                ) {
-                    Picker("", selection: $dictationLanguage) {
-                        ForEach(supportedLanguages, id: \.code) { lang in
-                            Text(lang.name).tag(lang.code)
+                CardGroup {
+                    SettingsRow(
+                        icon: "globe",
+                        iconColor: Color.green,
+                        title: "Dictation Language",
+                        subtitle: "Language for speech recognition"
+                    ) {
+                        Picker("", selection: $dictationLanguage) {
+                            ForEach(supportedLanguages, id: \.code) { lang in
+                                Text(lang.name).tag(lang.code)
+                            }
                         }
+                        .labelsHidden()
+                        .frame(width: 180)
                     }
-                    .labelsHidden()
-                    .frame(width: 180)
                 }
                 
                 // MARK: - Accessibility Section
                 
                 SectionHeader(title: "PERMISSIONS")
-                    .padding(.top, 20)
+                    .padding(.top, 24)
                 
-                SettingsRow(
-                    icon: "lock.shield",
-                    title: "Accessibility",
-                    subtitle: AccessibilityService.isAccessibilityEnabled()
-                        ? "Granted — global features active"
-                        : "Required for text selection and dictation injection"
-                ) {
-                    if AccessibilityService.isAccessibilityEnabled() {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                            .font(.system(size: 16))
-                    } else {
-                        Button("Grant Access") {
-                            AccessibilityService.requestAccessibilityPermission()
+                CardGroup {
+                    SettingsRow(
+                        icon: "hand.raised.fill",
+                        iconColor: Color.orange,
+                        title: "Accessibility",
+                        subtitle: AccessibilityService.isAccessibilityEnabled()
+                            ? "Granted — global features active"
+                            : "Required for text selection and dictation injection"
+                    ) {
+                        HStack(spacing: 8) {
+                            if AccessibilityService.isAccessibilityEnabled() {
+                                Image(systemName: "lock.open.fill")
+                                    .foregroundColor(.green)
+                            } else {
+                                Button("Grant Access") {
+                                    AccessibilityService.requestAccessibilityPermission()
+                                }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundColor(.accentColor)
+                                
+                                Image(systemName: "lock.fill")
+                                    .foregroundColor(Color(hex: "#8E8E93"))
+                            }
                         }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
                     }
                 }
                 
                 // MARK: - Data Section
                 
                 SectionHeader(title: "DATA")
-                    .padding(.top, 20)
+                    .padding(.top, 24)
                 
-                SettingsRow(
-                    icon: "trash",
-                    title: "Clear All History",
-                    subtitle: "\(historyManager.entries.count) entries stored locally"
-                ) {
-                    Button("Clear") {
-                        showClearConfirmation = true
+                CardGroup {
+                    SettingsRow(
+                        icon: "trash.fill",
+                        iconColor: Color.red,
+                        title: "Clear All History",
+                        subtitle: "\(historyManager.entries.count) entries stored locally"
+                    ) {
+                        Button("Clear") {
+                            if historyManager.entries.isEmpty {
+                                withAnimation(.spring(response: 0.1, dampingFraction: 0.2)) {
+                                    shakeOffset = 5
+                                }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                    withAnimation(.spring(response: 0.1, dampingFraction: 0.2)) {
+                                        shakeOffset = 0
+                                    }
+                                }
+                            } else {
+                                showClearConfirmation = true
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(Color(hex: "#FF3B30"))
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .tint(.red)
-                    .disabled(historyManager.entries.isEmpty)
                 }
+                .modifier(ShakeEffect(animatableData: shakeOffset))
                 
                 // MARK: - About
                 
-                VStack(spacing: 4) {
-                    Text("Local Whisper")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.secondary)
-                    Text("On-device. Private. Instant.")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary.opacity(0.6))
-                    Text("Your words never leave your Mac.")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary.opacity(0.5))
+                VStack(spacing: 0) {
+                    Text("Local Whisper · On-device · Private")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color(hex: "#C7C7CC"))
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.top, 32)
-                .padding(.bottom, 20)
+                .padding(.bottom, 24)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -163,6 +187,36 @@ struct SettingsView: View {
     }
 }
 
+// MARK: - Card Group Layout
+
+private struct CardGroup<Content: View>: View {
+    let content: Content
+    
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            content
+        }
+        .background(Color.white)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .padding(.horizontal, 24)
+        .shadow(color: Color.black.opacity(0.06), radius: 12, x: 0, y: 2)
+    }
+}
+
+// MARK: - Shake Animation
+
+struct ShakeEffect: GeometryEffect {
+    var animatableData: CGFloat
+    
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        ProjectionTransform(CGAffineTransform(translationX: -30 * sin(animatableData * .pi * 3), y: 0))
+    }
+}
+
 // MARK: - Section Header
 
 private struct SectionHeader: View {
@@ -170,9 +224,11 @@ private struct SectionHeader: View {
     
     var body: some View {
         Text(title)
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(.secondary)
-            .padding(.horizontal, 24)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(Color(hex: "#8E8E93"))
+            .textCase(.uppercase)
+            .tracking(0.5)
+            .padding(.horizontal, 40) // 24 + 16 inset
             .padding(.bottom, 6)
     }
 }
@@ -181,6 +237,7 @@ private struct SectionHeader: View {
 
 private struct SettingsRow<Trailing: View>: View {
     let icon: String
+    let iconColor: Color
     let title: String
     let subtitle: String
     @ViewBuilder let trailing: () -> Trailing
@@ -189,26 +246,25 @@ private struct SettingsRow<Trailing: View>: View {
         HStack(spacing: 12) {
             Image(systemName: icon)
                 .font(.system(size: 14))
-                .foregroundColor(.accentColor)
+                .foregroundColor(.white)
                 .frame(width: 28, height: 28)
-                .background(Color.accentColor.opacity(0.1))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .background(iconColor)
+                .clipShape(RoundedRectangle(cornerRadius: 7))
             
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(.primary)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(Color(hex: "#1C1C1E"))
                 Text(subtitle)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
+                    .font(.system(size: 13))
+                    .foregroundColor(Color(hex: "#8E8E93"))
             }
             
             Spacer()
             
             trailing()
         }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 8)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
     }
 }
