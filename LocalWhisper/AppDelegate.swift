@@ -4,11 +4,15 @@ import SwiftUI
 /// App delegate that manages the menu bar icon, global event listeners,
 /// and coordinates the background system-level features.
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     
     // MARK: - Menu Bar
     
     private var statusItem: NSStatusItem!
+    var onOpenWindowRequest: ((String) -> Void)?
+    
+    /// Strong reference to the main app window so it's never released.
+    private weak var mainWindow: NSWindow?
     
     // MARK: - Managers
     
@@ -30,6 +34,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupCoordinators()
         setupGlobalKeyListener()
         setupTextSelectionObserver()
+        
+        // Hook into the main window as soon as it appears so we can intercept close.
+        DispatchQueue.main.async {
+            self.claimMainWindow()
+        }
+    }
+    
+    /// Find the main app window and become its delegate so we can intercept close.
+    func claimMainWindow() {
+        guard mainWindow == nil else { return }
+        // The main window is the first non-panel window
+        if let win = NSApp.windows.first(where: { !($0 is NSPanel) }) {
+            self.mainWindow = win
+            win.delegate = self
+            configureWindow(win)
+        }
+    }
+    
+    // MARK: - NSWindowDelegate
+    
+    /// Instead of destroying the window, just hide it. This way makeKeyAndOrderFront
+    /// will always work and we never lose the SwiftUI view hierarchy.
+    nonisolated func windowShouldClose(_ sender: NSWindow) -> Bool {
+        Task { @MainActor in
+            sender.orderOut(nil)
+        }
+        return false
     }
     
     // MARK: - Menu Bar Setup
@@ -65,18 +96,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     
     @objc private func openMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        if let window = NSApp.windows.first(where: { $0.title == "Local Whisper" || $0.contentView is NSHostingView<MainAppView> }) {
+        
+        // Try the stored reference first (window was hidden, not destroyed)
+        if let window = mainWindow ?? NSApp.windows.first(where: { !($0 is NSPanel) }) {
+            mainWindow = window
             configureWindow(window)
             window.makeKeyAndOrderFront(nil)
-        } else {
-            for window in NSApp.windows {
-                if !(window is NSPanel) {
-                    configureWindow(window)
-                    window.makeKeyAndOrderFront(nil)
-                    break
-                }
-            }
+            return
         }
+        
+        // Fallback: window was somehow destroyed — ask SwiftUI to recreate it
+        onOpenWindowRequest?("main")
     }
     
     private func configureWindow(_ window: NSWindow) {

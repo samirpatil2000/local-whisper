@@ -8,9 +8,10 @@ import FoundationModels
 @main
 struct LocalWhisperApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    @Environment(\.openWindow) var openWindow
     
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "main") {
             MainAppView(
                 personaManager: appDelegate.personaManager,
                 historyManager: appDelegate.historyManager,
@@ -21,6 +22,11 @@ struct LocalWhisperApp: App {
                     appDelegate?.setFloatingToolbarEnabled(enabled)
                 }
             )
+            .onAppear {
+                appDelegate.onOpenWindowRequest = { id in
+                    openWindow(id: id)
+                }
+            }
         }
         .windowStyle(.titleBar)
         .defaultSize(width: 600, height: 680)

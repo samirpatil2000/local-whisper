@@ -17,8 +17,8 @@ final class RewriteToolbarWindow: NSPanel {
     private var clickMonitor: Any?
     private var keyMonitor: Any?
     
-    init() {
-        self.toolbarContent = ToolbarContentState()
+    init(personaManager: PersonaManager) {
+        self.toolbarContent = ToolbarContentState(personaManager: personaManager)
         
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 290, height: 38),
@@ -61,8 +61,21 @@ final class RewriteToolbarWindow: NSPanel {
             return
         }
         
-        // Calculate intrinsic size — 4 pills fit in ~290pt
-        let toolbarSize = NSSize(width: 290, height: toolbarHeight)
+        // Calculate intrinsic size based on content length
+        // Base width for the 4 static styles + padding
+        var estimatedWidth: CGFloat = 290
+        
+        if let personas = toolbarContent.personaManager?.personas, !personas.isEmpty {
+            for p in personas {
+                // Approximate 8pt per character + padding
+                estimatedWidth += 28 + (CGFloat(p.name.count) * 8)
+            }
+        }
+        
+        // Cap the maximum width to prevent it running off the entire screen
+        let maxWidth: CGFloat = 720
+        let finalWidth = min(estimatedWidth, maxWidth)
+        let toolbarSize = NSSize(width: finalWidth, height: toolbarHeight)
         
         // Calculate position relative to selection
         let position = calculatePosition(selectionBounds: selectionBounds, toolbarSize: toolbarSize)
@@ -198,6 +211,13 @@ final class ToolbarContentState {
     var activeStyleName: String? = nil
     var onAction: ((_ name: String, _ prompt: String) -> Void)?
     
+    // Hold reference to personas
+    var personaManager: PersonaManager?
+    
+    init(personaManager: PersonaManager? = nil) {
+        self.personaManager = personaManager
+    }
+    
     func reset() {
         isProcessing = false
         activeStyleName = nil
@@ -263,23 +283,43 @@ struct PillsRow: View {
     ]
     
     var body: some View {
-        HStack(spacing: 0) {
-            Spacer().frame(width: 10)
-            
-            ForEach(Array(styles.enumerated()), id: \.offset) { index, style in
-                if index > 0 {
-                    PillDivider()
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 0) {
+                Spacer().frame(width: 10)
+                
+                ForEach(Array(styles.enumerated()), id: \.offset) { index, style in
+                    if index > 0 {
+                        PillDivider()
+                    }
+                    
+                    PillButton(
+                        label: style.0,
+                        isPulsing: state.isProcessing && state.activeStyleName == style.0
+                    ) {
+                        state.onAction?(style.0, style.1)
+                    }
                 }
                 
-                PillButton(
-                    label: style.0,
-                    isPulsing: state.isProcessing && state.activeStyleName == style.0
-                ) {
-                    state.onAction?(style.0, style.1)
+                // Add separator and user personas if they exist
+                if let personas = state.personaManager?.personas, !personas.isEmpty {
+                    PillDivider()
+                    
+                    ForEach(Array(personas.enumerated()), id: \.offset) { index, persona in
+                        if index > 0 {
+                            PillDivider()
+                        }
+                        
+                        PillButton(
+                            label: persona.name,
+                            isPulsing: state.isProcessing && state.activeStyleName == persona.name
+                        ) {
+                            state.onAction?(persona.name, persona.systemPrompt)
+                        }
+                    }
                 }
+                
+                Spacer().frame(width: 10)
             }
-            
-            Spacer().frame(width: 10)
         }
     }
 }

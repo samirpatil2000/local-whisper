@@ -17,7 +17,7 @@ final class RewriteCoordinator {
     init(historyManager: HistoryManager, personaManager: PersonaManager) {
         self.historyManager = historyManager
         self.personaManager = personaManager
-        self.toolbarWindow = RewriteToolbarWindow()
+        self.toolbarWindow = RewriteToolbarWindow(personaManager: personaManager)
         
         toolbarWindow.onStyleSelected = { [weak self] name, prompt in
             guard let self else { return }
