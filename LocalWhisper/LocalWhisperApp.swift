@@ -298,6 +298,7 @@ final class SpeechRecognizer: ObservableObject {
     private var sessionOrder: [UUID] = []
     private var activeSessionID: UUID?
     private var startTask: Task<Void, Never>?
+    private var inactivityTask: Task<Void, Never>?
     private var updateTranscriptLive: Bool = false
     private var pendingStop: PendingStop?
     private var nextSessionSequence: Int = 0
@@ -317,6 +318,7 @@ final class SpeechRecognizer: ObservableObject {
         var didEndAudio = false
         var didComplete = false
         var lifecycleTask: Task<Void, Never>?
+        var watchdogTask: Task<Void, Never>?
         var lastResultAt: Date?
         
         init(sequence: Int, request: SFSpeechAudioBufferRecognitionRequest) {
@@ -442,10 +444,25 @@ final class SpeechRecognizer: ObservableObject {
                     return
                 }
                 
+                let timeoutTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .seconds(2))
+                    guard !Task.isCancelled, let self = self else { return }
+                    for id in remainingSessionIDs {
+                        if let session = self.sessions[id], !session.didComplete {
+                            session.task?.cancel()
+                            self.completeSession(id, finalText: nil)
+                        }
+                    }
+                }
+                
                 pendingStop = PendingStop(
                     continuation: continuation,
                     remainingSessionIDs: remainingSessionIDs
                 )
+                
+                // We don't cancel timeoutTask here because we actually want it to run until pendingStop resolves it!
+                // Wait, if pendingStop resolves normally, resolvePendingStop can cancel it, BUT pendingStop doesn't hold the timeoutTask!
+                // It's perfectly fine if timeoutTask fires after completion, because !session.didComplete will be false.
             }
         }
         
@@ -528,6 +545,7 @@ final class SpeechRecognizer: ObservableObject {
         do {
             try audioEngine.start()
             isRecording = true
+            resetInactivityTimer()
         } catch {
             errorMessage = "Failed to start audio engine: \(error.localizedDescription)"
             forceCleanup()
@@ -598,6 +616,16 @@ final class SpeechRecognizer: ObservableObject {
         guard let session = sessions[sessionID], !session.didEndAudio else { return }
         session.didEndAudio = true
         audioFanout.endAudio(for: sessionID)
+        
+        session.watchdogTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled, let self = self else { return }
+            if let activeSession = self.sessions[sessionID], !activeSession.didComplete {
+                print("[SpeechRecognizer] Session \(sessionID) timed out. Forcing completion.")
+                activeSession.task?.cancel()
+                self.completeSession(sessionID, finalText: nil)
+            }
+        }
     }
     
     private func handleRecognitionCallback(
@@ -613,8 +641,12 @@ final class SpeechRecognizer: ObservableObject {
             session.latestText = newText
             session.lastResultAt = Date()
             refreshLiveTranscriptIfNeeded()
+            resetInactivityTimer()
             
             if result.isFinal {
+                if !userRequestedStop {
+                    startSuccessorIfNeeded(after: sessionID)
+                }
                 completeSession(sessionID, finalText: result.bestTranscription.formattedString)
                 return
             }
@@ -635,6 +667,7 @@ final class SpeechRecognizer: ObservableObject {
         
         session.didComplete = true
         session.lifecycleTask?.cancel()
+        session.watchdogTask?.cancel()
         session.task = nil
         audioFanout.endAudio(for: sessionID)
         
@@ -654,6 +687,7 @@ final class SpeechRecognizer: ObservableObject {
         
         if !userRequestedStop {
             startReplacementSessionIfNeeded()
+            resetInactivityTimer()
         }
         
         refreshLiveTranscriptIfNeeded()
@@ -692,9 +726,7 @@ final class SpeechRecognizer: ObservableObject {
     
     private func flushCompletedChunksInOrder() {
         while let chunkText = completedChunkTexts.removeValue(forKey: nextSequenceToCommit) {
-            if !chunkText.isEmpty {
-                commitChunk(chunkText)
-            }
+            commitChunk(chunkText)
             nextSequenceToCommit += 1
         }
     }
@@ -838,6 +870,7 @@ final class SpeechRecognizer: ObservableObject {
     }
     
     private func finishStopping() {
+        inactivityTask?.cancel()
         if audioEngine.isRunning {
             audioEngine.stop()
             audioEngine.reset()
@@ -856,8 +889,10 @@ final class SpeechRecognizer: ObservableObject {
     }
     
     private func forceCleanup() {
+        inactivityTask?.cancel()
         for session in sessions.values {
             session.lifecycleTask?.cancel()
+            session.watchdogTask?.cancel()
             session.task?.cancel()
         }
         pendingStop = nil
@@ -876,6 +911,24 @@ final class SpeechRecognizer: ObservableObject {
         audioEngine.inputNode.removeTap(onBus: 0)
         audioFanout.removeAll()
         audioEngine = AVAudioEngine()
+    }
+    
+    private func resetInactivityTimer() {
+        inactivityTask?.cancel()
+        guard isRecording, !userRequestedStop else { return }
+        
+        inactivityTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(28))
+                guard let self = self, self.isRecording, !self.userRequestedStop else { return }
+                
+                if let activeID = self.activeSessionID {
+                    self.finalizeSession(activeID)
+                }
+            } catch {
+                // Cancelled
+            }
+        }
     }
 }
 
