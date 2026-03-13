@@ -1,6 +1,19 @@
 import AppKit
 import ApplicationServices
 
+enum InjectionFailureReason: Equatable {
+    case accessibilityPermissionDenied
+    case noFocusedEditableElement
+    case secureTextField
+    case pasteSimulationUnavailable
+}
+
+enum InjectionResult: Equatable {
+    case success
+    case failed(InjectionFailureReason)
+    case uncertain
+}
+
 /// System-level accessibility helpers for reading/writing text in any app.
 /// Requires Accessibility permission in System Settings → Privacy & Security.
 enum AccessibilityService {
@@ -19,6 +32,12 @@ enum AccessibilityService {
         _ = AXIsProcessTrustedWithOptions(
             [key: true] as CFDictionary
         )
+    }
+
+    static func copyTextToClipboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
     
     // MARK: - Focused Element (via frontmost app)
@@ -48,37 +67,18 @@ enum AccessibilityService {
     static func frontmostAppPID() -> pid_t? {
         return NSWorkspace.shared.frontmostApplication?.processIdentifier
     }
+
+    static func frontmostAppName() -> String? {
+        return NSWorkspace.shared.frontmostApplication?.localizedName
+    }
     
     /// Checks if the currently focused element is an editable text field.
     /// Returns true for text fields and text areas that are not read-only.
     static func isFocusedElementEditable() -> Bool {
         guard isAccessibilityEnabled() else { return false }
         guard let element = focusedElement() else { return false }
-        
-        // Check role — must be a text input element
-        var roleValue: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleValue) == .success,
-              let role = roleValue as? String else {
-            return false
-        }
-        
-        let editableRoles: Set<String> = [
-            kAXTextFieldRole as String,
-            kAXTextAreaRole as String,
-            "AXTextField",
-            "AXTextArea",
-            "AXComboBox",
-            "AXSearchField"
-        ]
-        
-        guard editableRoles.contains(role) else {
-            // Some apps use AXWebArea or AXGroup for contenteditable — check if value is settable
-            var isSettable: DarwinBoolean = false
-            let settableResult = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &isSettable)
-            return settableResult == .success && isSettable.boolValue
-        }
-        
-        return true
+
+        return isElementEditable(element)
     }
     
     // MARK: - Read Selected Text
@@ -140,20 +140,36 @@ enum AccessibilityService {
     
     /// Injects text at the cursor position in the target app.
     /// Uses clipboard-paste (Cmd+V) — works universally in every app.
-    static func injectText(_ text: String, targetPID: pid_t? = nil) {
-        injectViaClipboard(text)
+    static func injectText(_ text: String, targetPID: pid_t? = nil) -> InjectionResult {
+        guard isAccessibilityEnabled() else {
+            return .failed(.accessibilityPermissionDenied)
+        }
+
+        guard let targetPID else {
+            return .failed(.noFocusedEditableElement)
+        }
+
+        guard let element = focusedElement(forPID: targetPID) else {
+            return .failed(.noFocusedEditableElement)
+        }
+
+        if isSecureTextField(element) {
+            return .failed(.secureTextField)
+        }
+
+        guard isElementEditable(element) else {
+            return .failed(.noFocusedEditableElement)
+        }
+
+        return injectViaClipboard(text) ? .uncertain : .failed(.pasteSimulationUnavailable)
     }
     
     /// Injects text by temporarily setting the clipboard and simulating Cmd+V.
     /// Runs paste simulation on a background thread with synchronous delays for precise timing.
-    private static func injectViaClipboard(_ text: String) {
-        guard isAccessibilityEnabled() else {
-            print("[AccessibilityService] Cannot inject text: Accessibility permission not granted.")
-            return
-        }
-        
+    @discardableResult
+    private static func injectViaClipboard(_ text: String) -> Bool {
         let pasteboard = NSPasteboard.general
-        
+
         // Save current clipboard contents
         let savedItems = pasteboard.pasteboardItems?.compactMap { item -> (NSPasteboard.PasteboardType, Data)? in
             // Save all types for each item
@@ -167,7 +183,9 @@ enum AccessibilityService {
         
         // Set our text on the clipboard
         pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        guard pasteboard.setString(text, forType: .string) else {
+            return false
+        }
         
         // Run paste simulation on background thread with synchronous timing
         DispatchQueue.global(qos: .userInteractive).async {
@@ -198,5 +216,41 @@ enum AccessibilityService {
                 }
             }
         }
+
+        return true
+    }
+
+    private static func isElementEditable(_ element: AXUIElement) -> Bool {
+        let editableRoles: Set<String> = [
+            kAXTextFieldRole as String,
+            kAXTextAreaRole as String,
+            "AXTextField",
+            "AXTextArea",
+            "AXComboBox",
+            "AXSearchField"
+        ]
+
+        if let role = attributeValue(kAXRoleAttribute as CFString, on: element), editableRoles.contains(role) {
+            return true
+        }
+
+        var isSettable: DarwinBoolean = false
+        let settableResult = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &isSettable)
+        return settableResult == .success && isSettable.boolValue
+    }
+
+    private static func isSecureTextField(_ element: AXUIElement) -> Bool {
+        let secureRole = "AXSecureTextField"
+        let role = attributeValue(kAXRoleAttribute as CFString, on: element)
+        let subrole = attributeValue(kAXSubroleAttribute as CFString, on: element)
+        return role == secureRole || subrole == secureRole
+    }
+
+    private static func attributeValue(_ attribute: CFString, on element: AXUIElement) -> String? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+            return nil
+        }
+        return value as? String
     }
 }

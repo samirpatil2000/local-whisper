@@ -23,6 +23,21 @@ enum HistoryAction: String, Codable {
     case persona = "Persona"
 }
 
+enum InjectionStatus: String, Codable {
+    case injected
+    case fallback
+    case clipboard_only
+    case failed
+}
+
+struct DictationRecord: Codable {
+    var text: String
+    var timestamp: Date
+    var injectionStatus: InjectionStatus
+    var targetAppName: String?
+    var wasFocusChanged: Bool
+}
+
 struct HistoryEntry: Codable, Identifiable {
     var id = UUID()
     var timestamp: Date
@@ -30,6 +45,7 @@ struct HistoryEntry: Codable, Identifiable {
     var action: HistoryAction
     var styleName: String  // e.g. "Formal", "My CEO Voice", or custom instruction
     var resultText: String
+    var dictationRecord: DictationRecord? = nil
     
     var formattedTimestamp: String {
         let formatter = DateFormatter()

@@ -34,6 +34,63 @@ final class HistoryManager {
         }
         save()
     }
+
+    @discardableResult
+    func logDictation(
+        text: String,
+        targetAppName: String?,
+        injectionStatus: InjectionStatus = .failed,
+        wasFocusChanged: Bool = false
+    ) -> UUID {
+        let timestamp = Date()
+        let entry = HistoryEntry(
+            timestamp: timestamp,
+            originalText: "",
+            action: .dictation,
+            styleName: "Dictation",
+            resultText: text,
+            dictationRecord: DictationRecord(
+                text: text,
+                timestamp: timestamp,
+                injectionStatus: injectionStatus,
+                targetAppName: targetAppName,
+                wasFocusChanged: wasFocusChanged
+            )
+        )
+        entries.insert(entry, at: 0)
+
+        if entries.count > maxEntries {
+            entries = Array(entries.prefix(maxEntries))
+        }
+        save()
+        return entry.id
+    }
+
+    func updateDictationRecord(
+        id: UUID,
+        injectionStatus: InjectionStatus,
+        wasFocusChanged: Bool,
+        targetAppName: String? = nil
+    ) {
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
+
+        var record = entries[index].dictationRecord ?? DictationRecord(
+            text: entries[index].resultText,
+            timestamp: entries[index].timestamp,
+            injectionStatus: .failed,
+            targetAppName: nil,
+            wasFocusChanged: false
+        )
+
+        record.injectionStatus = injectionStatus
+        record.wasFocusChanged = wasFocusChanged
+        if let targetAppName {
+            record.targetAppName = targetAppName
+        }
+
+        entries[index].dictationRecord = record
+        save()
+    }
     
     func clearAll() {
         entries.removeAll()

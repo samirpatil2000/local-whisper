@@ -112,12 +112,118 @@ final class DictationPillWindow: NSPanel {
     }
 }
 
+@MainActor
+final class DictationToastWindow: NSPanel {
+
+    private let toastWidth: CGFloat = 300
+    private let toastHeight: CGFloat = 48
+    private let bottomOffset: CGFloat = 92
+
+    private let toastState = DictationToastState()
+    private var dismissWorkItem: DispatchWorkItem?
+
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 48),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        isMovableByWindowBackground = false
+        hidesOnDeactivate = false
+        ignoresMouseEvents = true
+
+        let content = DictationToastContent(state: toastState)
+        let hosting = NSHostingView(rootView: content)
+        hosting.frame = NSRect(x: 0, y: 0, width: toastWidth, height: toastHeight)
+
+        let effectView = NSVisualEffectView(frame: hosting.bounds)
+        effectView.material = .hudWindow
+        effectView.state = .active
+        effectView.blendingMode = .behindWindow
+        effectView.wantsLayer = true
+        effectView.layer?.cornerRadius = toastHeight / 2
+        effectView.layer?.masksToBounds = true
+        effectView.layer?.borderWidth = 0.5
+        effectView.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: toastWidth, height: toastHeight))
+        container.wantsLayer = true
+        container.layer?.cornerRadius = toastHeight / 2
+        container.layer?.masksToBounds = true
+
+        container.addSubview(effectView)
+        effectView.frame = container.bounds
+        effectView.autoresizingMask = [.width, .height]
+
+        hosting.frame = container.bounds
+        container.addSubview(hosting)
+        hosting.autoresizingMask = [.width, .height]
+
+        contentView = container
+    }
+
+    override var canBecomeKey: Bool { false }
+
+    override var canBecomeMain: Bool { false }
+
+    func show(message: String) {
+        dismissWorkItem?.cancel()
+        toastState.message = message
+
+        guard let screen = NSScreen.main else { return }
+        let screenFrame = screen.visibleFrame
+        let x = screenFrame.midX - toastWidth / 2
+        let y = screen.frame.origin.y + bottomOffset
+        setFrame(NSRect(x: x, y: y, width: toastWidth, height: toastHeight), display: true)
+
+        alphaValue = 0
+        orderFrontRegardless()
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            context.allowsImplicitAnimation = true
+            self.animator().alphaValue = 1.0
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.hideToast()
+        }
+        dismissWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: workItem)
+    }
+
+    private func hideToast() {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            context.allowsImplicitAnimation = true
+            self.animator().alphaValue = 0
+        }, completionHandler: {
+            self.orderOut(nil)
+        })
+    }
+}
+
 // MARK: - Pill State
 
 @Observable
 @MainActor
 final class DictationPillState {
     var isAnimating: Bool = false
+}
+
+@Observable
+@MainActor
+final class DictationToastState {
+    var message: String = ""
 }
 
 // MARK: - Pill Content View (SwiftUI)
@@ -143,6 +249,20 @@ struct DictationPillContent: View {
             Spacer()
         }
         .frame(width: 180, height: 48)
+    }
+}
+
+struct DictationToastContent: View {
+    let state: DictationToastState
+
+    var body: some View {
+        Text(state.message)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundColor(.white.opacity(0.92))
+            .multilineTextAlignment(.center)
+            .lineLimit(2)
+            .frame(width: 300, height: 48)
+            .padding(.horizontal, 18)
     }
 }
 
