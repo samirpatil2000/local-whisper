@@ -5,7 +5,7 @@ import AppKit
 @MainActor
 final class GlobalKeyListener {
     
-    var onFNDown: (() -> Void)?
+    var onFNDown: (() async -> Void)?
     var onFNUp: (() -> Void)?
     
     private var globalMonitor: Any?
@@ -50,7 +50,9 @@ final class GlobalKeyListener {
         if fnPressed && !isFNHeld {
             // FN key just pressed down
             isFNHeld = true
-            onFNDown?()
+            Task { @MainActor in
+                await onFNDown?()
+            }
         } else if !fnPressed && isFNHeld {
             // FN key just released
             isFNHeld = false

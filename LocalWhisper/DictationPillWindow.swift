@@ -70,6 +70,7 @@ final class DictationPillWindow: NSPanel {
     }
     
     func showPill() {
+        pillContent.isPreparing = false
         // Position: centered horizontally, 32pt from bottom
         guard let screen = NSScreen.main else { return }
         let screenFrame = screen.visibleFrame
@@ -96,8 +97,32 @@ final class DictationPillWindow: NSPanel {
         pillContent.isAnimating = true
     }
     
+    func showPreparing() {
+        pillContent.isPreparing = true
+        pillContent.isAnimating = false
+        
+        guard let screen = NSScreen.main else { return }
+        let screenFrame = screen.visibleFrame
+        let x = screenFrame.midX - pillWidth / 2
+        let y = screen.frame.origin.y + bottomOffset
+        setFrame(NSRect(x: x, y: y, width: pillWidth, height: pillHeight), display: true)
+        
+        alphaValue = 0
+        contentView?.layer?.setAffineTransform(CGAffineTransform(scaleX: 0.7, y: 0.7))
+        orderFrontRegardless()
+        
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.25
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            context.allowsImplicitAnimation = true
+            self.animator().alphaValue = 1.0
+            self.contentView?.layer?.setAffineTransform(.identity)
+        }
+    }
+    
     func hidePill() {
         pillContent.isAnimating = false
+        pillContent.isPreparing = false
         
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.2
@@ -218,6 +243,7 @@ final class DictationToastWindow: NSPanel {
 @MainActor
 final class DictationPillState {
     var isAnimating: Bool = false
+    var isPreparing: Bool = false
 }
 
 @Observable
@@ -235,16 +261,29 @@ struct DictationPillContent: View {
         HStack(spacing: 0) {
             Spacer().frame(width: 20)
             
-            // Mic icon with glow
-            Image(systemName: "mic.fill")
-                .font(.system(size: 18, weight: .medium))
-                .foregroundColor(.white)
-                .shadow(color: .white.opacity(0.4), radius: 6, x: 0, y: 0)
-            
-            Spacer().frame(width: 16)
-            
-            // Five waveform bars
-            WaveformBars(isAnimating: state.isAnimating)
+            if state.isPreparing {
+                // Formatting for Preparing state
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(.white.opacity(0.8))
+                
+                Spacer().frame(width: 14)
+                
+                Text("Preparing...")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(.white.opacity(0.8))
+            } else {
+                // Mic icon with glow
+                Image(systemName: "mic.fill")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(.white)
+                    .shadow(color: .white.opacity(0.4), radius: 6, x: 0, y: 0)
+                
+                Spacer().frame(width: 16)
+                
+                // Five waveform bars
+                WaveformBars(isAnimating: state.isAnimating)
+            }
             
             Spacer()
         }

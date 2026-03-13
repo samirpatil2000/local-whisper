@@ -35,8 +35,25 @@ final class DictationCoordinator {
         }
     }
     
+    var isReady: Bool { speechRecognizer.isReady }
+    
     /// Called when FN key is pressed down.
-    func beginDictation() {
+    func beginDictation() async {
+        // Readiness Gate
+        switch speechRecognizer.readiness {
+        case .unknown, .unavailable:
+            await speechRecognizer.warmUp()
+            if !speechRecognizer.isReady {
+                toastWindow.show(message: "Preparing dictation… please try again.")
+                return
+            }
+        case .checking:
+            toastWindow.show(message: "Speech model is loading…")
+            return
+        case .ready:
+            break
+        }
+        
         // Save the target app BEFORE we do anything
         targetAppPID = AccessibilityService.frontmostAppPID()
         targetAppName = AccessibilityService.frontmostAppName()

@@ -281,9 +281,22 @@ final class CorrectionsDictionary: ObservableObject {
 
 @MainActor
 final class SpeechRecognizer: ObservableObject {
+    enum ReadinessState: Equatable {
+        case unknown
+        case checking
+        case ready
+        case unavailable(String)
+    }
+
     @Published var transcript: String = ""
     @Published var isRecording: Bool = false
     @Published var errorMessage: String? = nil
+    @Published var readiness: ReadinessState = .unknown
+    
+    var isReady: Bool {
+        if case .ready = readiness { return true }
+        return false
+    }
     
     var corrections: CorrectionsDictionary?
     var onChunkCommitted: ((String) -> Void)?
@@ -301,6 +314,7 @@ final class SpeechRecognizer: ObservableObject {
     private var inactivityTask: Task<Void, Never>?
     private var updateTranscriptLive: Bool = false
     private var pendingStop: PendingStop?
+    private var isWarmingUp = false
     private var nextSessionSequence: Int = 0
     private var nextSequenceToCommit: Int = 0
     private var completedChunkTexts: [Int: String] = [:]
@@ -497,6 +511,11 @@ final class SpeechRecognizer: ObservableObject {
     }
     
     private func startRecordingInternal(updateTranscriptLive: Bool) async {
+        guard isReady else {
+            errorMessage = "Speech model is not ready."
+            return
+        }
+        
         // Guard against double-start
         if isRecording {
             return
@@ -890,6 +909,7 @@ final class SpeechRecognizer: ObservableObject {
     
     private func forceCleanup() {
         inactivityTask?.cancel()
+        readiness = .unknown
         for session in sessions.values {
             session.lifecycleTask?.cancel()
             session.watchdogTask?.cancel()
@@ -929,6 +949,42 @@ final class SpeechRecognizer: ObservableObject {
                 // Cancelled
             }
         }
+    }
+    
+    func warmUp() async {
+        if case .ready = readiness { return }
+        if case .unavailable = readiness { return }
+        
+        guard !isWarmingUp else { return }
+        isWarmingUp = true
+        defer { isWarmingUp = false }
+        
+        readiness = .checking
+        
+        let authStatus = await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { status in
+                continuation.resume(returning: status)
+            }
+        }
+        
+        guard authStatus == .authorized else {
+            readiness = .unavailable("Microphone/Speech authorization denied.")
+            return
+        }
+        
+        guard let speechRecognizer = speechRecognizer, speechRecognizer.isAvailable else {
+            readiness = .unavailable("On-device speech recognition is not available.")
+            return
+        }
+        
+        // Dry-run probe to force model load
+        let probeRequest = SFSpeechAudioBufferRecognitionRequest()
+        probeRequest.requiresOnDeviceRecognition = true
+        let probeTask = speechRecognizer.recognitionTask(with: probeRequest) { _, _ in }
+        probeRequest.endAudio()
+        probeTask.cancel()
+        
+        readiness = .ready
     }
 }
 

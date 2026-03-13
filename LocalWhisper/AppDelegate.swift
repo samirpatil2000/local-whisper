@@ -45,6 +45,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task { @MainActor in
+            await speechRecognizer.warmUp()
+        }
+    }
+    
     /// Find the main app window and become its delegate so we can intercept close.
     func claimMainWindow() {
         guard mainWindow == nil else { return }
@@ -131,6 +137,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             historyManager: historyManager,
             personaManager: personaManager
         )
+        
+        Task { @MainActor in
+            await speechRecognizer.warmUp()
+        }
     }
     
     // MARK: - Global Key Listener
@@ -142,7 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         globalKeyListener.isEnabled = fnEnabled
         
         globalKeyListener.onFNDown = { [weak self] in
-            self?.dictationCoordinator.beginDictation()
+            await self?.dictationCoordinator.beginDictation()
         }
         
         globalKeyListener.onFNUp = { [weak self] in
