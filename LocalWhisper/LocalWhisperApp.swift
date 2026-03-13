@@ -286,28 +286,90 @@ final class SpeechRecognizer: ObservableObject {
     @Published var errorMessage: String? = nil
     
     var corrections: CorrectionsDictionary?
+    var onChunkCommitted: ((String) -> Void)?
     
-    /// Text accumulated from previous recognition sessions within
-    /// the same recording. Each time Apple's recognizer times out
-    /// (~60s), we save what we have here and restart seamlessly.
     private var accumulatedTranscript: String = ""
-    
-    /// The partial text from the current recognition session only.
-    private var currentSessionText: String = ""
-    
-    /// Whether the user intentionally stopped recording (vs. auto-restart).
     private var userRequestedStop: Bool = false
     
-    /// Continuation used to await the final recognition result when stopping global dictation.
-    private var stopContinuation: CheckedContinuation<Void, Never>?
-    
     private var speechRecognizer: SFSpeechRecognizer?
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
     private var audioEngine = AVAudioEngine()
+    private let audioFanout = AudioRequestFanout()
+    private var sessions: [UUID: RecognitionSession] = [:]
+    private var sessionOrder: [UUID] = []
+    private var activeSessionID: UUID?
+    private var startTask: Task<Void, Never>?
+    private var updateTranscriptLive: Bool = false
+    private var pendingStop: PendingStop?
+    private var nextSessionSequence: Int = 0
+    private var nextSequenceToCommit: Int = 0
+    private var completedChunkTexts: [Int: String] = [:]
     
-    private var rolloverTimer: Timer?
-    private var watchdogTimer: Timer?
+    private static let chunkOverlap: Duration = .seconds(2)
+    private static let overlapLead: Duration = .seconds(13)
+    
+    private final class RecognitionSession {
+        let id = UUID()
+        let sequence: Int
+        let request: SFSpeechAudioBufferRecognitionRequest
+        var carriedText: String = ""
+        var task: SFSpeechRecognitionTask?
+        var latestText: String = ""
+        var didEndAudio = false
+        var didComplete = false
+        var lifecycleTask: Task<Void, Never>?
+        var lastResultAt: Date?
+        
+        init(sequence: Int, request: SFSpeechAudioBufferRecognitionRequest) {
+            self.sequence = sequence
+            self.request = request
+        }
+    }
+    
+    private final class PendingStop {
+        let continuation: CheckedContinuation<Void, Never>
+        var remainingSessionIDs: Set<UUID>
+        
+        init(continuation: CheckedContinuation<Void, Never>, remainingSessionIDs: Set<UUID>) {
+            self.continuation = continuation
+            self.remainingSessionIDs = remainingSessionIDs
+        }
+    }
+    
+    private final class AudioRequestFanout {
+        private let queue = DispatchQueue(label: "LocalWhisper.SpeechRecognizer.AudioRequestFanout")
+        private var requests: [UUID: SFSpeechAudioBufferRecognitionRequest] = [:]
+        
+        func add(_ request: SFSpeechAudioBufferRecognitionRequest, for id: UUID) {
+            queue.sync {
+                requests[id] = request
+            }
+        }
+        
+        func append(_ buffer: AVAudioPCMBuffer) {
+            queue.sync {
+                for request in requests.values {
+                    request.append(buffer)
+                }
+            }
+        }
+        
+        func endAudio(for id: UUID) {
+            queue.sync {
+                guard let request = requests.removeValue(forKey: id) else { return }
+                request.endAudio()
+            }
+        }
+        
+        func removeAll() {
+            queue.sync {
+                let activeRequests = Array(requests.values)
+                requests.removeAll()
+                for request in activeRequests {
+                    request.endAudio()
+                }
+            }
+        }
+    }
     
     init() {
         let locale = UserDefaults.standard.string(forKey: "dictationLanguage") ?? "en-US"
@@ -315,57 +377,79 @@ final class SpeechRecognizer: ObservableObject {
         speechRecognizer?.supportsOnDeviceRecognition = true
     }
     
-    /// The full transcript is accumulated + current session, with corrections applied.
     private var fullTranscript: String {
+        let currentSessionText = liveSessionText
         let combined: String
         if accumulatedTranscript.isEmpty {
             combined = currentSessionText
         } else if currentSessionText.isEmpty {
             combined = accumulatedTranscript
         } else {
-            combined = accumulatedTranscript + " " + currentSessionText
+            combined = mergedTranscript(accumulatedTranscript, currentSessionText)
         }
         return corrections?.apply(to: combined) ?? combined
     }
     
-    // MARK: - Global Dictation (Push-to-Talk)
-    
-    /// Start dictation for global FN key use (no UI transcript updates).
-    func startGlobalDictation() {
-        Task {
-            await startRecordingInternal(updateTranscriptLive: false)
+    private var liveSessionText: String {
+        for id in sessionOrder.reversed() {
+            guard let session = sessions[id], !session.didComplete else { continue }
+            let sessionText = sessionCombinedText(session)
+            if !sessionText.isEmpty {
+                return sessionText
+            }
         }
+        return ""
     }
     
-    /// Stop global dictation and return the final transcript.
-    /// Waits for the speech recognizer to deliver its final result before returning.
+    // MARK: - Global Dictation (Push-to-Talk)
+    
+    func startGlobalDictation() {
+        beginRecording(updateTranscriptLive: false)
+    }
+    
     func stopGlobalDictation() async -> String {
         userRequestedStop = true
         
-        // Stop the audio engine and signal end-of-audio, but DON'T cancel the task yet.
-        // Let the recognizer finish processing the buffered audio.
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
-        recognitionRequest?.endAudio()
+        if let startTask {
+            await startTask.value
+        }
         
-        // Wait for the recognition task to deliver its final result.
-        // The callback in startRecognitionTask will resume this continuation.
-        await withCheckedContinuation { continuation in
-            self.stopContinuation = continuation
-            
-            // Safety timeout — if the recognizer doesn't respond in 2 seconds, proceed anyway.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                if let cont = self.stopContinuation {
-                    self.stopContinuation = nil
-                    self.commitCurrentSession()
-                    cont.resume()
+        guard isRecording else {
+            return corrections?.apply(to: accumulatedTranscript) ?? accumulatedTranscript
+        }
+
+        let outstandingSessionIDs = Set(
+            sessionOrder.filter { id in
+                guard let session = sessions[id] else { return false }
+                return !session.didComplete
+            }
+        )
+        
+        for id in outstandingSessionIDs {
+            finalizeSession(id)
+        }
+        
+        if !outstandingSessionIDs.isEmpty {
+            await withCheckedContinuation { continuation in
+                let remainingSessionIDs = Set(
+                    outstandingSessionIDs.filter { id in
+                        !(sessions[id]?.didComplete ?? true)
+                    }
+                )
+                
+                if remainingSessionIDs.isEmpty {
+                    continuation.resume()
+                    return
                 }
+                
+                pendingStop = PendingStop(
+                    continuation: continuation,
+                    remainingSessionIDs: remainingSessionIDs
+                )
             }
         }
         
-        // Clean up
-        recognitionRequest = nil
-        recognitionTask = nil
+        finishStopping()
         isRecording = false
         return fullTranscript
     }
@@ -373,15 +457,25 @@ final class SpeechRecognizer: ObservableObject {
     // MARK: - Standard Recording
     
     func toggleRecording() {
-        if isRecording {
+        if isRecording || startTask != nil {
             userRequestedStop = true
-            stopAudioAndRecognition()
-            isRecording = false
-            transcript = fullTranscript
-        } else {
             Task {
-                await startRecordingInternal(updateTranscriptLive: true)
+                let finalTranscript = await self.stopGlobalDictation()
+                self.transcript = finalTranscript
             }
+        } else {
+            beginRecording(updateTranscriptLive: true)
+        }
+    }
+    
+    private func beginRecording(updateTranscriptLive: Bool) {
+        guard !isRecording, startTask == nil else { return }
+        userRequestedStop = false
+        
+        startTask = Task { [weak self] in
+            guard let self else { return }
+            await self.startRecordingInternal(updateTranscriptLive: updateTranscriptLive)
+            self.startTask = nil
         }
     }
     
@@ -391,16 +485,16 @@ final class SpeechRecognizer: ObservableObject {
             return
         }
         
-        // Fully clean up any prior session first
         forceCleanup()
         
         errorMessage = nil
         transcript = ""
         accumulatedTranscript = ""
-        currentSessionText = ""
-        userRequestedStop = false
+        nextSessionSequence = 0
+        nextSequenceToCommit = 0
+        completedChunkTexts.removeAll()
+        self.updateTranscriptLive = updateTranscriptLive
         
-        // Fast path for authorization to avoid async bounce when already authorized
         if SFSpeechRecognizer.authorizationStatus() != .authorized {
             let authStatus = await withCheckedContinuation { continuation in
                 SFSpeechRecognizer.requestAuthorization { status in
@@ -414,182 +508,353 @@ final class SpeechRecognizer: ObservableObject {
             }
         }
         
+        guard !userRequestedStop else {
+            forceCleanup()
+            return
+        }
+        
         guard let speechRecognizer = speechRecognizer, speechRecognizer.isAvailable else {
             errorMessage = "On-device speech recognition is not available on this device."
             return
         }
         
-        // Setup audio pipeline:
-        // 1. Remove old taps and PREPARE engine so hardware is initialized
-        // 2. Install the tap via startRecognitionTask
-        // 3. START engine so its very first audio buffers are caught by the tap
         let inputNode = audioEngine.inputNode
-        inputNode.removeTap(onBus: 0) // Remove any stale tap from a crashed previous session
+        inputNode.removeTap(onBus: 0)
         audioEngine.prepare()
         
-        // Now set up the recognition request + tap atomically.
-        startRecognitionTask(updateTranscriptLive: updateTranscriptLive)
+        startRecognitionSession(using: speechRecognizer)
+        installAudioTap(on: inputNode)
         
         do {
             try audioEngine.start()
             isRecording = true
         } catch {
             errorMessage = "Failed to start audio engine: \(error.localizedDescription)"
-            forceCleanup() // Ensure tap is removed if start fails
+            forceCleanup()
             return
         }
     }
     
-    /// Starts (or restarts) the recognition task.
-    /// This is the ONLY place where the audio tap is installed — never install taps elsewhere.
-    /// The request is created first, then the tap, so no audio buffers are lost.
-    private func startRecognitionTask(updateTranscriptLive: Bool) {
-        guard let speechRecognizer = speechRecognizer else { return }
-        
-        recognitionTask?.cancel()
-        recognitionTask = nil
-        
-        // 1. Create the recognition request FIRST
-        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let recognitionRequest = recognitionRequest else { return }
-        
+    private func startRecognitionSession(using speechRecognizer: SFSpeechRecognizer) {
+        let recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
         recognitionRequest.requiresOnDeviceRecognition = true
         recognitionRequest.shouldReportPartialResults = true
         
-        currentSessionText = ""
+        let session = RecognitionSession(
+            sequence: nextSessionSequence,
+            request: recognitionRequest
+        )
+        nextSessionSequence += 1
+        sessions[session.id] = session
+        sessionOrder.append(session.id)
+        activeSessionID = session.id
+        audioFanout.add(recognitionRequest, for: session.id)
         
-        // 2. Start the recognition task
-        recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
+        session.task = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             Task { @MainActor in
-                guard let self = self else { return }
-                
-                if let result = result {
-                    // We got speech! Cancel the watchdog timer
-                    self.watchdogTimer?.invalidate()
-                    
-                    self.currentSessionText = result.bestTranscription.formattedString
-                    
-                    if updateTranscriptLive {
-                        self.transcript = self.fullTranscript
-                    }
-                    
-                    if result.isFinal {
-                        self.commitCurrentSession()
-                        if let cont = self.stopContinuation {
-                            self.stopContinuation = nil
-                            cont.resume()
-                        }
-                    }
-                }
-                
-                if let error = error {
-                    self.commitCurrentSession()
-                    
-                    if let cont = self.stopContinuation {
-                        self.stopContinuation = nil
-                        cont.resume()
-                        return
-                    }
-                    
-                    let nsError = error as NSError
-                    let isCancellation = nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 216
-                    
-                    if !isCancellation && !self.userRequestedStop {
-                        self.startRecognitionTask(updateTranscriptLive: updateTranscriptLive)
-                    }
-                }
+                self?.handleRecognitionCallback(
+                    for: session.id,
+                    result: result,
+                    error: error
+                )
             }
         }
         
-        // 3. Install the audio tap AFTER the request exists (so buffers go to a live request)
-        //    Always remove first to prevent nullptr == Tap() Core Audio crash.
-        let inputNode = audioEngine.inputNode
+        scheduleSessionLifecycle(for: session.id)
+        refreshLiveTranscriptIfNeeded()
+    }
+    
+    private func installAudioTap(on inputNode: AVAudioInputNode) {
         inputNode.removeTap(onBus: 0)
         let recordingFormat = inputNode.outputFormat(forBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-            self?.recognitionRequest?.append(buffer)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [audioFanout] buffer, _ in
+            audioFanout.append(buffer)
         }
-        
-        // 4. Schedule the 45s rollover timer to bypass the ~60s Apple limit
-        rolloverTimer?.invalidate()
-        rolloverTimer = Timer.scheduledTimer(withTimeInterval: 45.0, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                self?.performRollover(updateTranscriptLive: updateTranscriptLive)
-            }
-        }
-        
-        // 5. Schedule a 3s watchdog timer. If we haven't seen *any* text by then,
-        // the SFSpeechRecognizer has likely deadlocked after inactivity. Reboot it.
-        watchdogTimer?.invalidate()
-        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 3.5, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                guard let self = self, self.isRecording, self.currentSessionText.isEmpty else { return }
-                print("[SpeechRecognizer] Watchdog fired: No speech detected in 3.5s. Rebooting recognizer...")
-                self.performRollover(updateTranscriptLive: updateTranscriptLive)
+    }
+    
+    private func scheduleSessionLifecycle(for sessionID: UUID) {
+        sessions[sessionID]?.lifecycleTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: Self.overlapLead)
+                self?.startSuccessorIfNeeded(after: sessionID)
+                try await Task.sleep(for: Self.chunkOverlap)
+                self?.finalizeSession(sessionID)
+            } catch {
+                return
             }
         }
     }
     
-    /// Bypasses the ~60s recognizer limit by cleanly ending the current session 
-    /// and immediately starting a new one without stopping the audio engine.
-    private func performRollover(updateTranscriptLive: Bool) {
-        guard isRecording else { return }
-        rolloverTimer?.invalidate()
-        watchdogTimer?.invalidate()
-        
-        let oldRequest = recognitionRequest
-        let oldTask = recognitionTask
-        
-        // Finalize the current text chunks
-        commitCurrentSession()
-        
-        // End the audio on the old request so it flushes
-        oldRequest?.endAudio()
-        
-        // Immediately start a new task catching the stream
-        startRecognitionTask(updateTranscriptLive: updateTranscriptLive)
-        
-        // Give the old task 1 second to parse the flushed audio, then cancel
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            oldTask?.cancel()
-        }
+    private func startSuccessorIfNeeded(after sessionID: UUID) {
+        guard isRecording, !userRequestedStop else { return }
+        guard activeSessionID == sessionID else { return }
+        guard let speechRecognizer = speechRecognizer, speechRecognizer.isAvailable else { return }
+        startRecognitionSession(using: speechRecognizer)
     }
     
-    /// Saves current session text into the accumulated transcript.
-    private func commitCurrentSession() {
-        if !currentSessionText.isEmpty {
-            if accumulatedTranscript.isEmpty {
-                accumulatedTranscript = currentSessionText
-            } else {
-                accumulatedTranscript += " " + currentSessionText
+    private func finalizeSession(_ sessionID: UUID) {
+        guard let session = sessions[sessionID], !session.didEndAudio else { return }
+        session.didEndAudio = true
+        audioFanout.endAudio(for: sessionID)
+    }
+    
+    private func handleRecognitionCallback(
+        for sessionID: UUID,
+        result: SFSpeechRecognitionResult?,
+        error: Error?
+    ) {
+        guard let session = sessions[sessionID], !session.didComplete else { return }
+        
+        if let result {
+            let newText = normalizedTranscriptText(result.bestTranscription.formattedString)
+            preserveUtteranceBoundaryIfNeeded(for: session, newText: newText)
+            session.latestText = newText
+            session.lastResultAt = Date()
+            refreshLiveTranscriptIfNeeded()
+            
+            if result.isFinal {
+                completeSession(sessionID, finalText: result.bestTranscription.formattedString)
+                return
             }
-            currentSessionText = ""
+        }
+        
+        if let error {
+            let nsError = error as NSError
+            let isCancellation = nsError.domain == "kAFAssistantErrorDomain" && nsError.code == 216
+            if !isCancellation {
+                print("[SpeechRecognizer] Session failed: \(error.localizedDescription)")
+            }
+            completeSession(sessionID, finalText: nil)
         }
     }
     
-    /// Stops the audio engine and cancels recognition.
-    private func stopAudioAndRecognition() {
-        forceCleanup()
-        commitCurrentSession()
+    private func completeSession(_ sessionID: UUID, finalText: String?) {
+        guard let session = sessions[sessionID], !session.didComplete else { return }
+        
+        session.didComplete = true
+        session.lifecycleTask?.cancel()
+        session.task = nil
+        audioFanout.endAudio(for: sessionID)
+        
+        let committedText = resolvedCommittedText(for: session, finalText: finalText)
+        if committedText.isEmpty {
+            print("[SpeechRecognizer] Session produced no final text; skipping chunk.")
+        }
+        completedChunkTexts[session.sequence] = committedText
+        flushCompletedChunksInOrder()
+        
+        sessions.removeValue(forKey: sessionID)
+        sessionOrder.removeAll { $0 == sessionID }
+        activeSessionID = sessionOrder.reversed().first { id in
+            guard let session = sessions[id] else { return false }
+            return !session.didComplete
+        }
+        
+        if !userRequestedStop {
+            startReplacementSessionIfNeeded()
+        }
+        
+        refreshLiveTranscriptIfNeeded()
+        resolvePendingStop(for: sessionID)
     }
     
-    /// Hard cleanup of all audio and recognition resources.
+    private func resolvedCommittedText(
+        for session: RecognitionSession,
+        finalText: String?
+    ) -> String {
+        let trimmedFinalText = normalizedTranscriptText(finalText ?? "")
+        if !trimmedFinalText.isEmpty {
+            return mergedTranscript(session.carriedText, trimmedFinalText)
+        }
+        
+        let trimmedPartialText = normalizedTranscriptText(session.latestText)
+        if !trimmedPartialText.isEmpty {
+            print("[SpeechRecognizer] Session ended without a final result; committing latest partial text.")
+            return mergedTranscript(session.carriedText, trimmedPartialText)
+        }
+        
+        return normalizedTranscriptText(session.carriedText)
+    }
+    
+    private func startReplacementSessionIfNeeded() {
+        guard isRecording, !userRequestedStop else { return }
+        guard activeSessionID == nil else { return }
+        guard let speechRecognizer = speechRecognizer, speechRecognizer.isAvailable else { return }
+        startRecognitionSession(using: speechRecognizer)
+    }
+    
+    private func commitChunk(_ chunkText: String) {
+        accumulatedTranscript = mergedTranscript(accumulatedTranscript, chunkText)
+        onChunkCommitted?(accumulatedTranscript)
+    }
+    
+    private func flushCompletedChunksInOrder() {
+        while let chunkText = completedChunkTexts.removeValue(forKey: nextSequenceToCommit) {
+            if !chunkText.isEmpty {
+                commitChunk(chunkText)
+            }
+            nextSequenceToCommit += 1
+        }
+    }
+    
+    private func resolvePendingStop(for sessionID: UUID) {
+        guard let pendingStop else { return }
+        pendingStop.remainingSessionIDs.remove(sessionID)
+        guard pendingStop.remainingSessionIDs.isEmpty else { return }
+        self.pendingStop = nil
+        pendingStop.continuation.resume()
+    }
+    
+    private func refreshLiveTranscriptIfNeeded() {
+        guard updateTranscriptLive else { return }
+        transcript = fullTranscript
+    }
+    
+    private func preserveUtteranceBoundaryIfNeeded(
+        for session: RecognitionSession,
+        newText: String
+    ) {
+        let previousText = normalizedTranscriptText(session.latestText)
+        guard !previousText.isEmpty, !newText.isEmpty else { return }
+        guard shouldCarryForward(previousText: previousText, newText: newText, lastResultAt: session.lastResultAt) else {
+            return
+        }
+        
+        session.carriedText = mergedTranscript(session.carriedText, previousText)
+    }
+    
+    private func shouldCarryForward(
+        previousText: String,
+        newText: String,
+        lastResultAt: Date?
+    ) -> Bool {
+        if previousText == newText || newText.hasPrefix(previousText) || previousText.hasPrefix(newText) {
+            return false
+        }
+        
+        if overlapWordCount(between: previousText, and: newText) > 0 {
+            return false
+        }
+        
+        let previousWordCount = wordTokens(in: previousText).count
+        guard previousWordCount >= 3 else { return false }
+        
+        guard let lastResultAt else { return false }
+        return Date().timeIntervalSince(lastResultAt) >= 1.0
+    }
+    
+    private func sessionCombinedText(_ session: RecognitionSession) -> String {
+        mergedTranscript(session.carriedText, session.latestText)
+    }
+    
+    private func mergedTranscript(_ base: String, _ addition: String) -> String {
+        let normalizedBase = normalizedTranscriptText(base)
+        let normalizedAddition = normalizedTranscriptText(addition)
+        
+        guard !normalizedBase.isEmpty else { return normalizedAddition }
+        guard !normalizedAddition.isEmpty else { return normalizedBase }
+        if normalizedBase == normalizedAddition {
+            return normalizedBase
+        }
+        if normalizedAddition.hasPrefix(normalizedBase) {
+            return normalizedAddition
+        }
+        if normalizedBase.hasPrefix(normalizedAddition) {
+            return normalizedBase
+        }
+        
+        let baseWords = wordTokens(in: normalizedBase)
+        let additionWords = wordTokens(in: normalizedAddition)
+        let maxOverlap = min(baseWords.count, additionWords.count, 12)
+        
+        if maxOverlap > 0 {
+            for overlap in stride(from: maxOverlap, through: 1, by: -1) {
+                let baseSlice = Array(baseWords.suffix(overlap))
+                let additionSlice = Array(additionWords.prefix(overlap))
+                if baseSlice.map(\.comparisonKey) == additionSlice.map(\.comparisonKey) {
+                    let suffixWords = additionWords.dropFirst(overlap).map(\.original)
+                    let suffixText = suffixWords.joined(separator: " ")
+                    return suffixText.isEmpty ? normalizedBase : normalizedBase + " " + suffixText
+                }
+            }
+        }
+        
+        return normalizedBase + " " + normalizedAddition
+    }
+    
+    private func normalizedTranscriptText(_ text: String) -> String {
+        text
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    private func overlapWordCount(between lhs: String, and rhs: String) -> Int {
+        let lhsWords = wordTokens(in: lhs)
+        let rhsWords = wordTokens(in: rhs)
+        let maxOverlap = min(lhsWords.count, rhsWords.count, 12)
+        guard maxOverlap > 0 else { return 0 }
+        
+        for overlap in stride(from: maxOverlap, through: 1, by: -1) {
+            let lhsSlice = Array(lhsWords.suffix(overlap))
+            let rhsSlice = Array(rhsWords.prefix(overlap))
+            if lhsSlice.map(\.comparisonKey) == rhsSlice.map(\.comparisonKey) {
+                return overlap
+            }
+        }
+        
+        return 0
+    }
+    
+    private func wordTokens(in text: String) -> [(original: String, comparisonKey: String)] {
+        normalizedTranscriptText(text)
+            .split(separator: " ")
+            .map { word in
+                let original = String(word)
+                let comparisonKey = original
+                    .lowercased()
+                    .trimmingCharacters(in: .punctuationCharacters)
+                return (original, comparisonKey)
+            }
+    }
+    
+    private func finishStopping() {
+        if audioEngine.isRunning {
+            audioEngine.stop()
+            audioEngine.reset()
+        }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioFanout.removeAll()
+        pendingStop = nil
+        activeSessionID = nil
+        sessions.removeAll()
+        sessionOrder.removeAll()
+        nextSessionSequence = 0
+        nextSequenceToCommit = 0
+        completedChunkTexts.removeAll()
+        updateTranscriptLive = false
+    }
+    
     private func forceCleanup() {
-        rolloverTimer?.invalidate()
-        rolloverTimer = nil
-        
-        watchdogTimer?.invalidate()
-        watchdogTimer = nil
+        for session in sessions.values {
+            session.lifecycleTask?.cancel()
+            session.task?.cancel()
+        }
+        pendingStop = nil
+        activeSessionID = nil
+        sessions.removeAll()
+        sessionOrder.removeAll()
+        nextSessionSequence = 0
+        nextSequenceToCommit = 0
+        completedChunkTexts.removeAll()
+        updateTranscriptLive = false
         
         if audioEngine.isRunning {
             audioEngine.stop()
-            audioEngine.reset() // Critical for waking up CoreAudio after sleep/inactivity
+            audioEngine.reset()
         }
         audioEngine.inputNode.removeTap(onBus: 0)
-        recognitionRequest?.endAudio()
-        recognitionRequest = nil
-        recognitionTask?.cancel()
-        recognitionTask = nil
+        audioFanout.removeAll()
     }
 }
 

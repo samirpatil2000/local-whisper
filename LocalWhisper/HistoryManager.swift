@@ -68,6 +68,7 @@ final class HistoryManager {
 
     func updateDictationRecord(
         id: UUID,
+        text: String? = nil,
         injectionStatus: InjectionStatus,
         wasFocusChanged: Bool,
         targetAppName: String? = nil
@@ -82,6 +83,10 @@ final class HistoryManager {
             wasFocusChanged: false
         )
 
+        if let text {
+            entries[index].resultText = text
+            record.text = text
+        }
         record.injectionStatus = injectionStatus
         record.wasFocusChanged = wasFocusChanged
         if let targetAppName {
@@ -108,7 +113,9 @@ final class HistoryManager {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         do {
             let data = try Data(contentsOf: fileURL)
-            entries = try JSONDecoder().decode([HistoryEntry].self, from: data)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            entries = try decoder.decode([HistoryEntry].self, from: data)
         } catch {
             print("[HistoryManager] Failed to load: \(error)")
         }

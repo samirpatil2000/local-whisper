@@ -16,12 +16,23 @@ final class DictationCoordinator {
     /// Saved before async work so we can inject text back into the right app.
     private var targetAppPID: pid_t?
     private var targetAppName: String?
+    private var draftHistoryID: UUID?
     
     init(speechRecognizer: SpeechRecognizer, historyManager: HistoryManager) {
         self.speechRecognizer = speechRecognizer
         self.historyManager = historyManager
         self.pillWindow = DictationPillWindow()
         self.toastWindow = DictationToastWindow()
+        self.speechRecognizer.onChunkCommitted = { [weak self] accumulatedText in
+            guard let self, let draftHistoryID = self.draftHistoryID else { return }
+            self.historyManager.updateDictationRecord(
+                id: draftHistoryID,
+                text: accumulatedText,
+                injectionStatus: .failed,
+                wasFocusChanged: false,
+                targetAppName: self.targetAppName
+            )
+        }
     }
     
     /// Called when FN key is pressed down.
@@ -29,6 +40,11 @@ final class DictationCoordinator {
         // Save the target app BEFORE we do anything
         targetAppPID = AccessibilityService.frontmostAppPID()
         targetAppName = AccessibilityService.frontmostAppName()
+        draftHistoryID = historyManager.logDictation(
+            text: "",
+            targetAppName: targetAppName,
+            injectionStatus: .failed
+        )
         
         pillWindow.showPill()
         speechRecognizer.startGlobalDictation()
@@ -40,18 +56,26 @@ final class DictationCoordinator {
         defer {
             targetAppPID = nil
             targetAppName = nil
+            draftHistoryID = nil
         }
 
         let transcript = await speechRecognizer.stopGlobalDictation()
         let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        guard !trimmedTranscript.isEmpty else { return }
-
-        let historyID = historyManager.logDictation(
+        let historyID = draftHistoryID ?? historyManager.logDictation(
             text: trimmedTranscript,
             targetAppName: targetAppName,
             injectionStatus: .failed
         )
+        
+        historyManager.updateDictationRecord(
+            id: historyID,
+            text: trimmedTranscript,
+            injectionStatus: .failed,
+            wasFocusChanged: false,
+            targetAppName: targetAppName
+        )
+        
+        guard !trimmedTranscript.isEmpty else { return }
 
         let endPID = AccessibilityService.frontmostAppPID()
         if targetAppPID != endPID {
