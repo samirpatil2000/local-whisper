@@ -140,8 +140,8 @@ final class DictationPillWindow: NSPanel {
 @MainActor
 final class DictationToastWindow: NSPanel {
 
-    private let toastWidth: CGFloat = 300
-    private let toastHeight: CGFloat = 48
+    private let toastWidth: CGFloat = 320
+    private let toastHeight: CGFloat = 60
     private let bottomOffset: CGFloat = 92
 
     private let toastState = DictationToastState()
@@ -149,7 +149,7 @@ final class DictationToastWindow: NSPanel {
 
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 300, height: 48),
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 60),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -300,7 +300,7 @@ struct DictationToastContent: View {
             .foregroundColor(.white.opacity(0.92))
             .multilineTextAlignment(.center)
             .lineLimit(2)
-            .frame(width: 300, height: 48)
+            .frame(width: 320, height: 60)
             .padding(.horizontal, 18)
     }
 }

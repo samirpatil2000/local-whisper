@@ -40,14 +40,41 @@ enum AccessibilityService {
         pasteboard.setString(text, forType: .string)
     }
     
-    // MARK: - Focused Element (via frontmost app)
+    // MARK: - Focused Element
     
-    /// Returns the AXUIElement for the focused text element in the frontmost application.
-    /// Uses NSWorkspace to get the frontmost app PID — more reliable than AX system-wide query.
+    /// Returns the focused element for the frontmost app, falling back to the system-wide
+    /// focused element when the app-scoped query fails or resolves to a non-editable element.
     private static func focusedElement() -> AXUIElement? {
+        let primaryElement = frontmostAppFocusedElement()
+        if let primaryElement, isElementEditable(primaryElement) {
+            return primaryElement
+        }
+
+        if let fallbackElement = systemWideFocusedElement() {
+            return fallbackElement
+        }
+
+        return primaryElement
+    }
+
+    /// Returns the focused element for the frontmost app's process.
+    private static func frontmostAppFocusedElement() -> AXUIElement? {
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return nil }
-        let pid = frontApp.processIdentifier
-        return focusedElement(forPID: pid)
+        return focusedElement(forPID: frontApp.processIdentifier)
+    }
+
+    /// Returns the focused element from the system-wide accessibility tree.
+    private static func systemWideFocusedElement() -> AXUIElement? {
+        let systemWideElement = AXUIElementCreateSystemWide()
+        var focusedElement: AnyObject?
+        let result = AXUIElementCopyAttributeValue(
+            systemWideElement,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedElement
+        )
+        guard result == .success else { return nil }
+        guard let focusedElement else { return nil }
+        return (focusedElement as! AXUIElement)
     }
     
     /// Returns the focused element for a specific app by PID.
@@ -76,9 +103,13 @@ enum AccessibilityService {
     /// Returns true for text fields and text areas that are not read-only.
     static func isFocusedElementEditable() -> Bool {
         guard isAccessibilityEnabled() else { return false }
-        guard let element = focusedElement() else { return false }
 
-        return isElementEditable(element)
+        if let frontmostElement = frontmostAppFocusedElement(), isElementEditable(frontmostElement) {
+            return true
+        }
+
+        guard let fallbackElement = systemWideFocusedElement() else { return false }
+        return isElementEditable(fallbackElement)
     }
     
     // MARK: - Read Selected Text
@@ -138,27 +169,19 @@ enum AccessibilityService {
     
     // MARK: - Inject Text
     
-    /// Injects text at the cursor position in the target app.
-    /// Uses clipboard-paste (Cmd+V) — works universally in every app.
+    /// Injects text at the current cursor position in the frontmost app.
+    /// Uses clipboard-paste (Cmd+V) after a best-effort secure-field check.
+    /// The optional target PID is preserved for compatibility but not used to choose the destination.
     static func injectText(_ text: String, targetPID: pid_t? = nil) -> InjectionResult {
         guard isAccessibilityEnabled() else {
             return .failed(.accessibilityPermissionDenied)
         }
 
-        guard let targetPID else {
-            return .failed(.noFocusedEditableElement)
-        }
+        // Preserve the signature for callers, but paste into whatever is focused now.
+        _ = targetPID
 
-        guard let element = focusedElement(forPID: targetPID) else {
-            return .failed(.noFocusedEditableElement)
-        }
-
-        if isSecureTextField(element) {
+        if let element = focusedElement(), isSecureTextField(element) {
             return .failed(.secureTextField)
-        }
-
-        guard isElementEditable(element) else {
-            return .failed(.noFocusedEditableElement)
         }
 
         return injectViaClipboard(text) ? .uncertain : .failed(.pasteSimulationUnavailable)

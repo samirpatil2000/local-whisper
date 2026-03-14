@@ -32,14 +32,17 @@ final class TextSelectionObserver {
         
         let selectedText = AccessibilityService.getSelectedText()
         let trimmed = selectedText?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isChromeFamilyApp = isFrontmostChromeFamilyApp()
         
         if let text = trimmed, !text.isEmpty {
             // Text is selected — only notify if it changed and the element is editable
             if text != lastSelectedText {
                 lastSelectedText = text
                 
-                // Only show toolbar for editable text fields
-                guard AccessibilityService.isFocusedElementEditable() else { return }
+                if !isChromeFamilyApp {
+                    // Only show toolbar for editable text fields outside Chrome-family apps.
+                    guard AccessibilityService.isFocusedElementEditable() else { return }
+                }
                 
                 if let bounds = AccessibilityService.getSelectionBounds() {
                     onSelectionChanged?(text, bounds)
@@ -55,5 +58,14 @@ final class TextSelectionObserver {
     /// Force re-check (e.g. after a rewrite completes and we expect selection to be gone)
     func clearTracking() {
         lastSelectedText = nil
+    }
+
+    private func isFrontmostChromeFamilyApp() -> Bool {
+        guard let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else {
+            return false
+        }
+
+        let normalized = bundleIdentifier.lowercased()
+        return normalized.contains("chrome") || normalized.contains("chromium")
     }
 }

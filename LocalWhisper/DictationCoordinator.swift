@@ -13,7 +13,7 @@ final class DictationCoordinator {
     let toastWindow: DictationToastWindow
     
     /// The PID of the app that was focused when dictation started.
-    /// Saved before async work so we can inject text back into the right app.
+    /// Saved so we can track whether focus changed while dictating.
     private var targetAppPID: pid_t?
     private var targetAppName: String?
     private var draftHistoryID: UUID?
@@ -95,33 +95,26 @@ final class DictationCoordinator {
         guard !trimmedTranscript.isEmpty else { return }
 
         let endPID = AccessibilityService.frontmostAppPID()
-        if targetAppPID != endPID {
-            historyManager.updateDictationRecord(
-                id: historyID,
-                injectionStatus: .fallback,
-                wasFocusChanged: true,
-                targetAppName: targetAppName
-            )
-            toastWindow.show(message: "App changed. Saved to history.")
-            return
-        }
+        let endAppName = AccessibilityService.frontmostAppName()
+        let wasFocusChanged = targetAppPID != endPID
+        let injectionTargetAppName = endAppName ?? targetAppName
 
-        let injectionResult = AccessibilityService.injectText(trimmedTranscript, targetPID: targetAppPID)
+        let injectionResult = AccessibilityService.injectText(trimmedTranscript)
         switch injectionResult {
         case .success, .uncertain:
             historyManager.updateDictationRecord(
                 id: historyID,
                 injectionStatus: .injected,
-                wasFocusChanged: false,
-                targetAppName: targetAppName
+                wasFocusChanged: wasFocusChanged,
+                targetAppName: injectionTargetAppName
             )
         case .failed(let reason):
             AccessibilityService.copyTextToClipboard(trimmedTranscript)
             historyManager.updateDictationRecord(
                 id: historyID,
                 injectionStatus: .clipboard_only,
-                wasFocusChanged: false,
-                targetAppName: targetAppName
+                wasFocusChanged: wasFocusChanged,
+                targetAppName: injectionTargetAppName
             )
             toastWindow.show(message: toastMessage(for: reason))
         }
