@@ -1,6 +1,44 @@
 import AppKit
 import SwiftUI
 
+private enum ToolbarLayoutMetrics {
+    static let minimumWidth: CGFloat = 290
+    static let pillHeight: CGFloat = 28
+    static let outerHorizontalPadding: CGFloat = 10
+    static let outerVerticalPadding: CGFloat = 5
+    static let dividerWidth: CGFloat = 0.5
+    static let dividerHeight: CGFloat = 16
+    static let rowSpacing: CGFloat = 6
+    static let screenEdgePadding: CGFloat = 8
+    static let selectionGap: CGFloat = 10
+    static let cornerRadius: CGFloat = 19
+    static let pillHorizontalPadding: CGFloat = 14
+}
+
+private let baseToolbarStyles: [(String, String)] = [
+    ("Rewrite", "Rewrite this text to be clearer and more polished while preserving the meaning."),
+    ("Formal", "Rewrite this text in a formal, professional tone."),
+    ("Concise", "Rewrite this text to be shorter and more concise while keeping the core meaning."),
+    ("Friendly", "Rewrite this text in a warm, friendly, conversational tone."),
+]
+
+private struct ToolbarChipItem: Identifiable {
+    let id: String
+    let label: String
+    let prompt: String
+    let width: CGFloat
+}
+
+private struct ToolbarChipRow {
+    let chips: [ToolbarChipItem]
+    let width: CGFloat
+}
+
+private struct ToolbarLayoutResult {
+    let size: NSSize
+    let availableContentWidth: CGFloat
+}
+
 // MARK: - Rewrite Toolbar Window
 
 /// Floating rewrite toolbar that appears above selected text.
@@ -11,7 +49,6 @@ final class RewriteToolbarWindow: NSPanel {
     var onStyleSelected: ((_ styleName: String, _ prompt: String) -> Void)?
     var onDismiss: (() -> Void)?
     
-    private let toolbarHeight: CGFloat = 38
     private let toolbarContent: ToolbarContentState
     private var hostingView: NSHostingView<RewriteToolbarContent>?
     private var clickMonitor: Any?
@@ -21,7 +58,12 @@ final class RewriteToolbarWindow: NSPanel {
         self.toolbarContent = ToolbarContentState(personaManager: personaManager)
         
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 290, height: 38),
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: ToolbarLayoutMetrics.minimumWidth,
+                height: ToolbarLayoutMetrics.pillHeight + (ToolbarLayoutMetrics.outerVerticalPadding * 2)
+            ),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -30,7 +72,9 @@ final class RewriteToolbarWindow: NSPanel {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = false // We handle shadow manually
-        level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+        // Use a menu-like window level so the toolbar reliably appears above browsers
+        // and other app content without needing to activate LocalWhisper.
+        level = .popUpMenu
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         isMovableByWindowBackground = false
         hidesOnDeactivate = false
@@ -65,27 +109,28 @@ final class RewriteToolbarWindow: NSPanel {
             return
         }
         
-        // Calculate intrinsic size based on content length
-        // Base width for the 4 static styles + padding
-        var estimatedWidth: CGFloat = 290
+        let screen = screenContainingSelection(selectionBounds) ?? NSScreen.main
+        let availableWindowWidth = max(
+            1,
+            (screen?.visibleFrame.width ?? ToolbarLayoutMetrics.minimumWidth) -
+                (ToolbarLayoutMetrics.screenEdgePadding * 2)
+        )
+        let layout = toolbarLayout(
+            personaManager: toolbarContent.personaManager,
+            availableWindowWidth: availableWindowWidth
+        )
         
-        if let personas = toolbarContent.personaManager?.personas, !personas.isEmpty {
-            for p in personas {
-                // Approximate 8pt per character + padding
-                estimatedWidth += 28 + (CGFloat(p.name.count) * 8)
-            }
-        }
-        
-        // Cap the maximum width to prevent it running off the entire screen
-        let maxWidth: CGFloat = 720
-        let finalWidth = min(estimatedWidth, maxWidth)
-        let toolbarSize = NSSize(width: finalWidth, height: toolbarHeight)
+        toolbarContent.availableContentWidth = layout.availableContentWidth
         
         // Calculate position relative to selection
-        let position = calculatePosition(selectionBounds: selectionBounds, toolbarSize: toolbarSize)
+        let position = calculatePosition(
+            selectionBounds: selectionBounds,
+            toolbarSize: layout.size,
+            on: screen
+        )
         
         // Set frame — calculate everything BEFORE showing
-        setContentSize(toolbarSize)
+        setContentSize(layout.size)
         setFrameOrigin(position)
         
         // Start invisible and scaled
@@ -116,45 +161,53 @@ final class RewriteToolbarWindow: NSPanel {
             context.allowsImplicitAnimation = true
             self.animator().alphaValue = 0
             self.contentView?.layer?.setAffineTransform(CGAffineTransform(scaleX: 0.94, y: 0.94))
-        }, completionHandler: {
-            self.orderOut(nil)
-            self.contentView?.layer?.setAffineTransform(.identity)
-            self.toolbarContent.reset()
-            self.onDismiss?()
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.orderOut(nil)
+                self.contentView?.layer?.setAffineTransform(.identity)
+                self.toolbarContent.reset()
+                self.onDismiss?()
+            }
         })
     }
     
     
     // MARK: - Position Calculation
     
-    private func calculatePosition(selectionBounds: CGRect, toolbarSize: NSSize) -> NSPoint {
-        guard let screen = NSScreen.main else {
-            return NSPoint(x: selectionBounds.midX - toolbarSize.width / 2,
-                           y: selectionBounds.maxY + 10)
+    private func calculatePosition(
+        selectionBounds: CGRect,
+        toolbarSize: NSSize,
+        on screen: NSScreen?
+    ) -> NSPoint {
+        let selectionRect = appKitRect(fromAccessibility: selectionBounds)
+        
+        guard let screen else {
+            return NSPoint(
+                x: selectionRect.midX - toolbarSize.width / 2,
+                y: selectionRect.maxY + ToolbarLayoutMetrics.selectionGap
+            )
         }
         
-        let screenFrame = screen.frame
-        let gap: CGFloat = 10
-        
-        // macOS screen coordinates: origin at bottom-left, Y increases upward
-        // AX bounds: origin at top-left, Y increases downward
-        // Convert AX bounds to screen coordinates
-        let selectionTop = screenFrame.height - selectionBounds.origin.y
-        let selectionBottom = screenFrame.height - (selectionBounds.origin.y + selectionBounds.height)
+        let screenFrame = screen.visibleFrame
+        let gap = ToolbarLayoutMetrics.selectionGap
+        let pad = ToolbarLayoutMetrics.screenEdgePadding
         
         // Try positioning above the selection first
-        var y = selectionTop + gap
+        var y = selectionRect.maxY + gap
         
         // If too close to top of screen, flip to below
-        if y + toolbarSize.height > screenFrame.maxY - 10 {
-            y = selectionBottom - gap - toolbarSize.height
+        if y + toolbarSize.height > screenFrame.maxY - pad {
+            y = selectionRect.minY - gap - toolbarSize.height
         }
         
+        y = min(y, screenFrame.maxY - toolbarSize.height - pad)
+        y = max(y, screenFrame.minY + pad)
+        
         // Horizontal: center on selection
-        var x = selectionBounds.midX - toolbarSize.width / 2
+        var x = selectionRect.midX - toolbarSize.width / 2
         
         // Clamp to screen edges
-        let pad: CGFloat = 8
         if x < screenFrame.minX + pad {
             x = screenFrame.minX + pad
         }
@@ -171,7 +224,7 @@ final class RewriteToolbarWindow: NSPanel {
         removeDismissMonitors()
         
         // Click outside
-        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             guard let self, self.isVisible else { return }
             let loc = NSEvent.mouseLocation
             if !self.frame.contains(loc) {
@@ -206,6 +259,167 @@ final class RewriteToolbarWindow: NSPanel {
     }
 }
 
+@MainActor
+private func toolbarLayout(
+    personaManager: PersonaManager?,
+    availableWindowWidth: CGFloat
+) -> ToolbarLayoutResult {
+    let constrainedWindowWidth = max(1, availableWindowWidth)
+    let initialContentWidth = max(
+        1,
+        constrainedWindowWidth - (ToolbarLayoutMetrics.outerHorizontalPadding * 2)
+    )
+    let initialRows = toolbarRows(
+        personaManager: personaManager,
+        maxContentWidth: initialContentWidth
+    )
+    let initialRowWidth = initialRows.map(\.width).max() ?? 0
+    var resolvedWindowWidth = min(
+        constrainedWindowWidth,
+        max(
+            ToolbarLayoutMetrics.minimumWidth,
+            initialRowWidth + (ToolbarLayoutMetrics.outerHorizontalPadding * 2)
+        )
+    )
+    var resolvedContentWidth = max(
+        1,
+        resolvedWindowWidth - (ToolbarLayoutMetrics.outerHorizontalPadding * 2)
+    )
+    let rows = toolbarRows(
+        personaManager: personaManager,
+        maxContentWidth: resolvedContentWidth
+    )
+    let maxRowWidth = rows.map(\.width).max() ?? 0
+    resolvedWindowWidth = min(
+        constrainedWindowWidth,
+        max(
+            ToolbarLayoutMetrics.minimumWidth,
+            maxRowWidth + (ToolbarLayoutMetrics.outerHorizontalPadding * 2)
+        )
+    )
+    resolvedContentWidth = max(
+        1,
+        resolvedWindowWidth - (ToolbarLayoutMetrics.outerHorizontalPadding * 2)
+    )
+    
+    let rowCount = max(rows.count, 1)
+    let height =
+        (ToolbarLayoutMetrics.outerVerticalPadding * 2) +
+        (CGFloat(rowCount) * ToolbarLayoutMetrics.pillHeight) +
+        (CGFloat(max(rowCount - 1, 0)) * ToolbarLayoutMetrics.rowSpacing)
+    
+    return ToolbarLayoutResult(
+        size: NSSize(width: resolvedWindowWidth, height: height),
+        availableContentWidth: resolvedContentWidth
+    )
+}
+
+@MainActor
+private func toolbarRows(
+    personaManager: PersonaManager?,
+    maxContentWidth: CGFloat
+) -> [ToolbarChipRow] {
+    let chips = toolbarChipItems(
+        personaManager: personaManager,
+        maxChipWidth: maxContentWidth
+    )
+    return wrapToolbarRows(chips: chips, maxContentWidth: maxContentWidth)
+}
+
+@MainActor
+private func toolbarChipItems(
+    personaManager: PersonaManager?,
+    maxChipWidth: CGFloat
+) -> [ToolbarChipItem] {
+    let builtInItems = baseToolbarStyles.map { style in
+        ToolbarChipItem(
+            id: "style-\(style.0)",
+            label: style.0,
+            prompt: style.1,
+            width: measuredPillWidth(label: style.0, maxChipWidth: maxChipWidth)
+        )
+    }
+    let personaItems = (personaManager?.personas ?? []).map { persona in
+        ToolbarChipItem(
+            id: "persona-\(persona.id.uuidString)",
+            label: persona.name,
+            prompt: persona.systemPrompt,
+            width: measuredPillWidth(label: persona.name, maxChipWidth: maxChipWidth)
+        )
+    }
+    return builtInItems + personaItems
+}
+
+private func wrapToolbarRows(
+    chips: [ToolbarChipItem],
+    maxContentWidth: CGFloat
+) -> [ToolbarChipRow] {
+    guard !chips.isEmpty else { return [] }
+    
+    var rows: [ToolbarChipRow] = []
+    var currentRow: [ToolbarChipItem] = []
+    var currentWidth: CGFloat = 0
+    
+    for chip in chips {
+        let dividerWidth = currentRow.isEmpty ? 0 : ToolbarLayoutMetrics.dividerWidth
+        let proposedWidth = currentWidth + dividerWidth + chip.width
+        
+        if !currentRow.isEmpty && proposedWidth > maxContentWidth {
+            rows.append(ToolbarChipRow(chips: currentRow, width: currentWidth))
+            currentRow = [chip]
+            currentWidth = chip.width
+            continue
+        }
+        
+        if !currentRow.isEmpty {
+            currentWidth += ToolbarLayoutMetrics.dividerWidth
+        }
+        currentRow.append(chip)
+        currentWidth += chip.width
+    }
+    
+    if !currentRow.isEmpty {
+        rows.append(ToolbarChipRow(chips: currentRow, width: currentWidth))
+    }
+    
+    return rows
+}
+
+private func measuredPillWidth(label: String, maxChipWidth: CGFloat) -> CGFloat {
+    let attributes: [NSAttributedString.Key: Any] = [.font: pillLabelFont()]
+    let textWidth = ceil((label as NSString).size(withAttributes: attributes).width)
+    let paddedWidth = textWidth + (ToolbarLayoutMetrics.pillHorizontalPadding * 2)
+    return min(paddedWidth, maxChipWidth)
+}
+
+private func pillLabelFont() -> NSFont {
+    let baseFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+    let roundedDescriptor = baseFont.fontDescriptor.withDesign(.rounded) ?? baseFont.fontDescriptor
+    return NSFont(descriptor: roundedDescriptor, size: 12.5) ?? baseFont
+}
+
+private func screenContainingSelection(_ selectionBounds: CGRect) -> NSScreen? {
+    let selectionRect = appKitRect(fromAccessibility: selectionBounds)
+    return NSScreen.screens.first(where: { $0.frame.intersects(selectionRect) })
+        ?? NSScreen.screens.first(where: { $0.frame.contains(selectionRect.center) })
+}
+
+private func appKitRect(fromAccessibility rect: CGRect) -> CGRect {
+    let desktopMaxY = NSScreen.screens.map(\.frame.maxY).max() ?? NSScreen.main?.frame.maxY ?? 0
+    return CGRect(
+        x: rect.origin.x,
+        y: desktopMaxY - rect.maxY,
+        width: rect.width,
+        height: rect.height
+    )
+}
+
+private extension CGRect {
+    var center: CGPoint {
+        CGPoint(x: midX, y: midY)
+    }
+}
+
 // MARK: - Toolbar State
 
 @Observable
@@ -213,6 +427,8 @@ final class RewriteToolbarWindow: NSPanel {
 final class ToolbarContentState {
     var isProcessing: Bool = false
     var activeStyleName: String? = nil
+    var availableContentWidth: CGFloat =
+        ToolbarLayoutMetrics.minimumWidth - (ToolbarLayoutMetrics.outerHorizontalPadding * 2)
     var onAction: ((_ name: String, _ prompt: String) -> Void)?
     
     // Hold reference to personas
@@ -242,19 +458,21 @@ struct RewriteToolbarContent: View {
             VisualEffectBackground()
             
             // Shadow layer
-            RoundedRectangle(cornerRadius: 19)
+            RoundedRectangle(cornerRadius: ToolbarLayoutMetrics.cornerRadius)
                 .fill(Color.clear)
                 .shadow(color: Color.black.opacity(0.30), radius: 16, x: 0, y: -4)
             
             // Border overlay
-            RoundedRectangle(cornerRadius: 19)
+            RoundedRectangle(cornerRadius: ToolbarLayoutMetrics.cornerRadius)
                 .strokeBorder(Color.white.opacity(0.10), lineWidth: 0.5)
             
             // Content
             PillsRow(state: state)
+                .padding(.horizontal, ToolbarLayoutMetrics.outerHorizontalPadding)
+                .padding(.vertical, ToolbarLayoutMetrics.outerVerticalPadding)
         }
-        .frame(height: 38)
-        .clipShape(RoundedRectangle(cornerRadius: 19))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: ToolbarLayoutMetrics.cornerRadius))
         .preferredColorScheme(.dark)
     }
 }
@@ -269,7 +487,7 @@ struct VisualEffectBackground: NSViewRepresentable {
         view.blendingMode = .behindWindow
         view.appearance = NSAppearance(named: .darkAqua)
         view.wantsLayer = true
-        view.layer?.cornerRadius = 19
+        view.layer?.cornerRadius = ToolbarLayoutMetrics.cornerRadius
         view.layer?.masksToBounds = true
         return view
     }
@@ -282,52 +500,33 @@ struct VisualEffectBackground: NSViewRepresentable {
 struct PillsRow: View {
     let state: ToolbarContentState
     
-    private let styles: [(String, String)] = [
-        ("Rewrite", "Rewrite this text to be clearer and more polished while preserving the meaning."),
-        ("Formal", "Rewrite this text in a formal, professional tone."),
-        ("Concise", "Rewrite this text to be shorter and more concise while keeping the core meaning."),
-        ("Friendly", "Rewrite this text in a warm, friendly, conversational tone."),
-    ]
-    
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 0) {
-                Spacer().frame(width: 10)
-                
-                ForEach(Array(styles.enumerated()), id: \.offset) { index, style in
-                    if index > 0 {
-                        PillDivider()
-                    }
-                    
-                    PillButton(
-                        label: style.0,
-                        isPulsing: state.isProcessing && state.activeStyleName == style.0
-                    ) {
-                        state.onAction?(style.0, style.1)
-                    }
-                }
-                
-                // Add separator and user personas if they exist
-                if let personas = state.personaManager?.personas, !personas.isEmpty {
-                    PillDivider()
-                    
-                    ForEach(Array(personas.enumerated()), id: \.offset) { index, persona in
+        let rows = toolbarRows(
+            personaManager: state.personaManager,
+            maxContentWidth: state.availableContentWidth
+        )
+        
+        VStack(spacing: ToolbarLayoutMetrics.rowSpacing) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                HStack(spacing: 0) {
+                    ForEach(Array(row.chips.enumerated()), id: \.element.id) { index, chip in
                         if index > 0 {
                             PillDivider()
                         }
                         
                         PillButton(
-                            label: persona.name,
-                            isPulsing: state.isProcessing && state.activeStyleName == persona.name
+                            label: chip.label,
+                            totalWidth: chip.width,
+                            isPulsing: state.isProcessing && state.activeStyleName == chip.label
                         ) {
-                            state.onAction?(persona.name, persona.systemPrompt)
+                            state.onAction?(chip.label, chip.prompt)
                         }
                     }
                 }
-                
-                Spacer().frame(width: 10)
+                .frame(maxWidth: .infinity, alignment: .center)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .center)
     }
 }
 
@@ -335,6 +534,7 @@ struct PillsRow: View {
 
 struct PillButton: View {
     let label: String
+    let totalWidth: CGFloat?
     let isPulsing: Bool
     let action: () -> Void
     
@@ -343,37 +543,55 @@ struct PillButton: View {
     @State private var pulseOpacity: Double = 0.88
     
     var body: some View {
-        Text(label)
-            .fixedSize()
-            .font(.system(size: 12.5, weight: .medium, design: .rounded))
-            .foregroundColor(labelColor)
-            .padding(.horizontal, 14)
-            .frame(height: 28)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(backgroundColor)
-            )
-            .onHover { hovering in
-                isHovered = hovering
-                if hovering {
-                    NSCursor.pointingHand.push()
-                } else {
-                    NSCursor.pop()
-                }
+        Group {
+            if let totalWidth {
+                Text(label)
+                    .font(.system(size: 12.5, weight: .medium, design: .rounded))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .foregroundColor(labelColor)
+                    .frame(
+                        width: max(
+                            0,
+                            totalWidth - (ToolbarLayoutMetrics.pillHorizontalPadding * 2)
+                        ),
+                        alignment: .center
+                    )
+                    .padding(.horizontal, ToolbarLayoutMetrics.pillHorizontalPadding)
+            } else {
+                Text(label)
+                    .fixedSize()
+                    .font(.system(size: 12.5, weight: .medium, design: .rounded))
+                    .foregroundColor(labelColor)
+                    .padding(.horizontal, ToolbarLayoutMetrics.pillHorizontalPadding)
             }
-            .onTapGesture {
-                // Flash effect
-                isPressed = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                    isPressed = false
-                }
-                action()
+        }
+        .frame(height: ToolbarLayoutMetrics.pillHeight)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(backgroundColor)
+        )
+        .onHover { hovering in
+            isHovered = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
             }
-            .onChange(of: isPulsing) { _, pulsing in
-                if pulsing {
-                    startPulse()
-                }
+        }
+        .onTapGesture {
+            // Flash effect
+            isPressed = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                isPressed = false
             }
+            action()
+        }
+        .onChange(of: isPulsing) { _, pulsing in
+            if pulsing {
+                startPulse()
+            }
+        }
     }
     
     private var labelColor: Color {
@@ -406,8 +624,9 @@ struct PillDivider: View {
     var body: some View {
         Rectangle()
             .fill(Color.white.opacity(0.08))
-            .frame(width: 0.5, height: 16)
+            .frame(
+                width: ToolbarLayoutMetrics.dividerWidth,
+                height: ToolbarLayoutMetrics.dividerHeight
+            )
     }
 }
-
-
